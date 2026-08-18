@@ -1,0 +1,43 @@
+# L3 RGB mapping camera — PLACEHOLDER.
+#
+# The L3 sensor specifications have not been supplied and are not publicly established
+# (docs/decisions-and-verification.md, V10). Everything below is inherited from the L2
+# profile purely so that the identifier resolves; nothing here has been validated against
+# an actual L3 acquisition.
+#
+# Do not use this profile for a delivered product until the sensor characteristics are
+# confirmed and this comment is removed.
+
+profile_id: l3_rgb_master
+profile_version: 1
+
+sensor: L3_RGB
+lens: null
+
+processing:
+  engine: ODM
+  odm:
+    dsm: false
+    dtm: false
+
+radiometry:
+  policy: analytical_master
+  provisional: true
+  odm:
+    texturing-skip-global-seam-leveling: true
+    orthophoto-cutline: false
+    build-overviews: false
+    orthophoto-compression: DEFLATE
+    radiometric-calibration: none
+
+outputs:
+  orthophoto: true
+  dsm: false
+  point_cloud: false
+
+qa:
+  raster_contract: true
+
+packaging:
+  source_asset: odm_orthophoto/odm_orthophoto.tif
+  allow_alpha_from_nodata: false

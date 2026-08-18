@@ -1,0 +1,28 @@
+# Example block.yaml for a DJI P1 acquisition.
+#
+# The CRS and vertical reference are declared, never inferred from imagery. If the vertical
+# reference is genuinely unknown, say UNKNOWN rather than guessing: the run still proceeds,
+# but it is marked unsuitable for absolute-Z QA, which is the honest outcome.
+#
+# The reference system here follows the Buduunkhad delivery convention. Confirm both codes
+# against the survey documentation for the project before processing a delivered product —
+# a neighbouring project may sit in a different UTM zone.
+
+project_id: Buduunkhad
+block_id: B064
+sensor: P1_35
+lens: "35mm"
+
+crs: EPSG:32647          # WGS 84 / UTM zone 47N
+
+vertical:
+  height_type: NORMAL
+  epsg: 5705
+  datum_name: Baltic 1977
+  geoid_model: Mongolia Geoid 2012
+  geoid_applied: true
+
+notes: >
+  Placeholder block. P1 imagery is not part of the Buduunkhad XV-023222 delivery; replace
+  the identifiers with the real acquisition and confirm the vertical reference against that
+  survey's own metadata rather than copying it from here.

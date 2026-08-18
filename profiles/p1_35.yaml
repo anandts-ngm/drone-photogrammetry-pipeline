@@ -1,0 +1,51 @@
+# DJI Zenmuse P1, 35 mm lens — analytical master.
+#
+# Tuning values (feature/point-cloud quality, resolutions) are deliberately NOT frozen here.
+# They come from benchmark processing against the current production workflow, not from
+# guesswork. Only the settings that the master contract or the radiometric policy actually
+# constrain are pinned below.
+#
+# Option names are ODM's own and were verified against ODM opendm/config.py on 2026-08-18.
+
+profile_id: p1_35_master
+profile_version: 1
+
+sensor: P1_35
+lens: "35mm"
+
+processing:
+  engine: ODM
+  odm:
+    dsm: true
+    dtm: false
+
+radiometry:
+  policy: analytical_master
+
+  # Provisional: ODM normalises colours across all images unless told not to, and its own
+  # help text recommends skipping that for radiometric data. Set true here so a default run
+  # does not quietly apply engine-side colour normalisation to a product labelled
+  # analytical. Must be benchmarked BOTH ways on B64/B66, B44/B51 and N3/N7 before it is
+  # treated as settled. See docs/radiometry.md.
+  provisional: true
+
+  odm:
+    texturing-skip-global-seam-leveling: true
+    orthophoto-cutline: false
+    build-overviews: false
+    orthophoto-compression: DEFLATE
+    radiometric-calibration: none
+
+outputs:
+  orthophoto: true
+  dsm: true
+  point_cloud: true
+
+qa:
+  raster_contract: true
+
+packaging:
+  # ODM also writes odm_orthophoto.original.tif, which is the same product before --crop is
+  # applied. The cropped one is delivered; the uncropped one stays available in the run.
+  source_asset: odm_orthophoto/odm_orthophoto.tif
+  allow_alpha_from_nodata: false

@@ -1,0 +1,226 @@
+# Assumptions, open decisions, and verification log
+
+Status: draft for review. This is the working document for everything that is not yet
+settled. Items move out of §2 as they are decided and out of §3 as they are verified.
+
+---
+
+## 1. Assumptions taken
+
+These are proceeding without a blocking question. Each states what happens if it is wrong.
+
+| # | Assumption | If wrong |
+|---|---|---|
+| A1 | Python 3.12 is pinned. It has full wheel coverage across Rasterio/GDAL/pyproj/Shapely and is not at the edge of the geospatial ecosystem's support. | Change one line in `pyproject.toml` and regenerate `uv.lock`. Cheap. |
+| A2 | Development happens on Windows 11 with Docker Desktop; NodeODM runs in a Linux container; CI runs on Linux. Code is written path-portable (`pathlib`, no shell-isms). | Cheap if caught early, expensive if not — so path portability is enforced from the first commit rather than assumed. |
+| A3 | The CLI is installed as `drone-photo` while the distribution/repository is `drone-photogrammetry-pipeline`. | Rename in one `[project.scripts]` entry. |
+| A4 | One workspace root, configured once, holding all generated data; source block directories are strictly read-only. | This is a mandate, not really an assumption. Recorded here because the workspace *layout* under that root is my proposal (`architecture.md` §5) and can be changed. |
+| A5 | `run_id = <block>_<UTC compact>_<8 hex>`; runs are never overwritten, only added. | Trivial to change; nothing depends on its format except human readability. |
+| A6 | Milestone 1 resolves navigation from EXIF only, and records the height type it finds rather than converting anything. MRK/PPK are interfaces with no implementation. | This is the stated milestone scope. |
+| A7 | Full SHA-256 over all source imagery on every run. For a large P1 block this is I/O-bound and noticeable, but traceability was named as the priority over convenience. | If runtime proves unacceptable, add an opt-out flag that records *that it was used* in the manifest. Never silently downgrade the hash. |
+| A8 | Block/project CRS and vertical datum are declared per block in `block.yaml` and validated, not inferred from imagery. | None — this is the safe direction. The actual values still have to come from you (§2.5). |
+
+---
+
+## 2. Decisions
+
+§2.1–2.3 were decided on 2026-08-18 and are marked **DECIDED**. The rest remain open.
+
+### 2.1 GDAL backend for the master packager — **DECIDED: option (a)**
+
+Packaging uses the GDAL bundled in the Rasterio wheel, behind a `RasterBackend` protocol so
+a Docker backend can be added later without touching callers. The manifest records the
+backend name, the real GDAL version reported at runtime, and the creation options actually
+used. It does not record a CLI command that was never executed.
+
+The packager needs GDAL. Three realistic options:
+
+| Option | Pros | Cons |
+|---|---|---|
+| **(a) GDAL bundled in the Rasterio wheel** *(recommended)* | Pure `uv sync` install, works on Windows and Linux identically, no host GDAL, version pinned by the lockfile, testable in CI with no containers | No `gdal_translate` binary; packaging is done through the GDAL API. The manifest records the API call and creation options, and the equivalent CLI command as documentation only |
+| (b) Pinned `osgeo/gdal` Docker image | Byte-identical GDAL everywhere; real CLI command strings in the audit trail | Container round-trip and volume mounting per packaging operation; awkward on Windows paths; CI needs the image |
+| (c) System GDAL on the host | Simplest conceptually | Not reproducible; GDAL is currently not installed on this machine; version drift is exactly what the reproducibility requirement forbids |
+
+Recommendation: **(a)**, behind a `RasterBackend` protocol so (b) can be added later without
+touching callers. The audit trail records the actual GDAL version and the actual creation
+options used — it will not record a CLI command that was never executed.
+
+### 2.2 ODM / NodeODM version pin
+
+The requirement "no `latest` Docker tags" and "pin the newest ODM" currently conflict:
+
+- Latest ODM release: **`v3.6.2`**, published 2026-08-12.
+- Newest **concrete** `opendronemap/nodeodm` Docker Hub tag: **`3.5.6`**, pushed 2025-07-17.
+- `opendronemap/nodeodm:latest` and `:master` moved 2026-03-25 — floating, so disallowed.
+
+Options:
+
+1. Pin `opendronemap/nodeodm:3.5.6`. Reproducible today, ~13 months behind ODM.
+2. Pin by image **digest** (`opendronemap/nodeodm@sha256:...`) taken from `latest`. Fully
+   reproducible and current; less readable, and needs a documented refresh procedure.
+3. Build our own NodeODM image on ODM `v3.6.2`. Most current and fully controlled; adds an
+   image-build pipeline we would then own.
+
+**DECIDED: option (2), digest pin.** `docker-compose.yml` pins
+`opendronemap/nodeodm@sha256:<digest>` resolved from the current `latest`, so nothing
+floats while staying current. The digest is refreshed deliberately, never implicitly, and
+the manifest records `engineVersion` from `/info` as ground truth for what actually ran.
+The digest is resolved in Phase 4 when compose is written.
+
+### 2.3 Global seam leveling default for `analytical_master` — **DECIDED: skip leveling**
+
+ODM normalises colours across all images by default. ODM's own documentation recommends
+disabling that for radiometric data.
+
+Profiles ship with `texturing-skip-global-seam-leveling: true` and
+`radiometry.provisional: true`, matching ODM's own advice for radiometric data. The value
+is provisional pending the B64/B66, B44/B51 and N3/N7 benchmarks, which must be run **both
+ways** before the setting is frozen. Erring toward preserving source radiometry rather than
+toward a better-looking mosaic is the deliberate choice here. See `radiometry.md` §4.
+
+### 2.4 Which ODM orthophoto is authoritative
+
+ODM emits both `odm_orthophoto.tif` (cropped by `--crop`, default 3 m) and
+`odm_orthophoto.original.tif` (uncropped). The cropped one is the sensible default for a
+delivered product; the uncropped one preserves marginal coverage. This is a profile setting
+either way — the decision is what the default should be.
+
+### 2.5 Project CRS and vertical datum values — **RESOLVED for Buduunkhad**
+
+Supplied by `METADATA_Buduunkhad_XV-023222.txt` in the delivery:
+
+| | |
+|---|---|
+| Horizontal | `EPSG:32647` — WGS 84 / UTM zone 47N |
+| Vertical | `EPSG:5705` — Baltic 1977 height, **normal** heights over a quasigeoid |
+| Compound | `EPSG:32647+5705` |
+| Geoid | Mongolia Geoid 2012, **already applied in the field** before processing |
+
+Three consequences the code now reflects:
+
+1. **`HeightType.NORMAL` was added.** Baltic 1977 is a normal-height system, explicitly not
+   orthometric and not ellipsoidal. The enum could not previously express the actual data,
+   and forcing it to `ORTHOMETRIC` would have been precisely the silent mixing of vertical
+   references the mandate forbids.
+2. **Reapplying a geoid would introduce ~48 m of error.** `VerticalReference.geoid_applied`
+   records that the transformation has already happened, because that fact exists only in
+   the document.
+3. **The vertical CRS is absent from every delivered file header.** The metadata sheet is
+   the only authoritative basis, so the pipeline can never recover it by inspection. The
+   master therefore declares the compound CRS explicitly (`--declare-crs`), recorded as a
+   metadata-only operation, which is exactly what the delivery's own instructions ask for
+   (`gdal_edit.py -a_srs "EPSG:32647+5705"`, and never `gdalwarp`).
+
+Still needed for other projects: the same two codes for Sant and any other area. Nothing is
+inferred.
+
+### 2.7 Repackage versus metadata-only fast path — **DECIDED: full repackage**
+
+Only one contract clause is violated by the delivered DOMs (the NoData value), which is
+metadata, so a byte-copy plus an in-place header edit looked attractive against 92 GiB of
+input. Measurement settled it: packaging `B78` (447 MB) took **41.5 s including
+`--verify-pixels`** and produced a **340 MB** master, because Terra does not use a
+compression predictor and this pipeline does.
+
+Extrapolated over 79 zones: roughly 2.5 hours, and the output set is about **70 GiB against
+92 GiB of input**. A byte-copy fast path would consume the full 92 GiB and save nothing, so
+it is not worth the second code path.
+
+### 2.6 Deviations from the proposed repository tree
+
+Six small additions, each with a reason, listed in `milestone-1-plan.md` §2. Flagged here
+because the kickoff asked for changes to the tree to be explained.
+
+---
+
+## 3. Verification log
+
+The kickoff requires that uncertain ODM/NodeODM behaviour be verified rather than guessed.
+
+### 3.1 Verified — 2026-08-18
+
+| Item | Finding | Source |
+|---|---|---|
+| NodeODM API surface | `/info`, `/options`, `/task/new`, `/task/new/init`, `/task/new/upload/{uuid}`, `/task/new/commit/{uuid}`, `/task/list`, `/task/{uuid}/info`, `/task/{uuid}/output`, `/task/{uuid}/download/{asset}`, `/task/cancel`, `/task/restart`, `/task/remove`, `/auth/*`; optional `token` query parameter | NodeODM `docs/index.adoc` |
+| Task status codes | `10` QUEUED, `20` RUNNING, `30` FAILED, `40` COMPLETED, `50` CANCELED; `progress` 0–100 | NodeODM `docs/index.adoc` |
+| Downloadable assets | **Only `all.zip`.** `getAssetsArchivePath()` returns `false` for anything else | NodeODM `libs/Task.js` |
+| ODM ortho creation options | `TILED=YES`, `COMPRESS=<--orthophoto-compression>`, `PREDICTOR=2` for LZW/DEFLATE else `1`, `BIGTIFF=IF_SAFER`, `BLOCKXSIZE=BLOCKYSIZE=512` | ODM `opendm/orthophoto.py: get_orthophoto_vars()` |
+| ODM overview building | `gdaladdo -r average --config BIGTIFF_OVERVIEW IF_SAFER --config COMPRESS_OVERVIEW JPEG {ortho} 2 4 8 16` — lossy | ODM `opendm/orthophoto.py: build_overviews()` |
+| Seam leveling default | `--texturing-skip-global-seam-leveling` default `False`; help: *"Skip normalization of colors across all images. Useful when processing radiometric data."* | ODM `opendm/config.py` |
+| Orthophoto resolution semantics | `--orthophoto-resolution` default `5`, cm/pixel, *"capped by a ground sampling distance (GSD) estimate"* — a target, not a guarantee | ODM `opendm/config.py` |
+| Other option defaults | `--orthophoto-compression DEFLATE`; `--orthophoto-no-tiled False`; `--build-overviews False`; `--crop 3`; `--dsm False`; `--dtm False`; `--dem-resolution 5`; `--pc-quality medium`; `--feature-quality high`; `--radiometric-calibration none`; `--camera-lens auto`; `--primary-band auto`; `--use-exif False` | ODM `opendm/config.py` |
+| ODM output paths | `odm_orthophoto/odm_orthophoto.tif`, `odm_orthophoto/odm_orthophoto.original.tif`, `odm_dem/dsm.tif`, `odm_dem/dtm.tif`, `odm_georeferencing/odm_georeferenced_model.laz`, `opensfm/reconstruction.json` | ODM output documentation |
+| Ortho alpha band | RGB orthophotos carry an alpha band; ODM treats band 4 as alpha in its own gdalwarp calls | ODM `opendm/orthophoto.py` |
+| Versions | ODM `v3.6.2` (2026-08-12); NodeODM `v2.2.3` (2024-05-15); newest concrete nodeodm image tag `3.5.6` (2025-07-17) | GitHub releases API, Docker Hub tags API |
+
+### 3.1.1 Verified locally — 2026-08-18 (GDAL 3.12.4, Rasterio 1.5.1, Python 3.12.13)
+
+Measured on this machine rather than reasoned about, because the answers decide how the
+packager writes the validity mask.
+
+| Item | Finding |
+|---|---|
+| **V7 — `ALPHA=NON-PREMULTIPLIED`** | **Accepted.** With `PHOTOMETRIC=RGB` + `ALPHA=NON-PREMULTIPLIED`, band 4 reads back as `alpha`. This is what the packager uses, and a packaged master passes every contract check. |
+| GTiff alpha tagging generally | Whether band 4 counts as alpha is decided by the TIFF `ExtraSamples` tag written **at creation time**: no creation options → alpha (the driver's default); `PHOTOMETRIC=RGB` alone → undefined; `PHOTOMETRIC=RGB` + `ALPHA=UNSPECIFIED` → undefined. |
+| Post-hoc colour interpretation | Assigning `colorinterp` to an already-created GTiff **does not survive** when `PHOTOMETRIC=RGB` was given without an `ALPHA` option — the assignment is accepted and then silently lost on reopen. Alpha is therefore only ever set through the creation option, never after the fact. This bit the first version of the test fixtures, which claimed to build a tagged-alpha raster and actually built an untagged one. |
+| Lossless round-trip | RGB band checksums are identical before and after packaging across every fixture, including striped/LZW/classic-TIFF sources. |
+
+### 3.1.2 Verified against the real Buduunkhad delivery — 2026-08-18
+
+`C:\MINING_PIPELINE_INPUTS\buduunkhad\buduunkhad` — 79 zones `B1`–`B79`, each holding
+`dom.tif`, `dsm.tif`, `dtm.tif`, `cloud_merged.laz`. Headers only were read, with
+`GDAL_PAM_ENABLED=NO` so GDAL could not write `.aux.xml` sidecars into the source tree.
+
+**All 79 DOMs share exactly one raster signature**, totalling 92.1 GiB:
+
+| Property | Delivered value | Master contract |
+|---|---|---|
+| Driver / bands / dtype | GeoTIFF, 4, uint8 | ✅ |
+| Colour interpretation | red, green, blue, **alpha** | ✅ |
+| Compression | DEFLATE | ✅ |
+| Tiled | yes, 256×256 | ✅ |
+| BigTIFF | yes | ✅ |
+| Overviews | none | ✅ |
+| CRS | `EPSG:32647` (horizontal only) | ✅ |
+| **NoData** | **`0` on all four bands** | ❌ **the only violation** |
+
+So a Terra DOM is one metadata flag away from conforming. It also means the delivery hits a
+case the original alpha decision table did not name: **a tagged alpha band and an ambiguous
+`NoData=0` present at the same time.** Alpha wins, the NoData is dropped, and the drop is
+recorded as a packaging operation. Confirmed on a real file: `alpha: passthrough`, band-4
+checksum identical, master passes QA.
+
+Other measurements:
+
+- **47 distinct native pixel sizes across 79 zones, 2.54 cm to 5.11 cm**, in clusters near
+  2.5, 3.1, 3.7 and 5.0 cm. Every one is square and axis-aligned. This is the strongest
+  possible argument for the no-rounding rule: normalising these to a common grid would
+  resample 79 blocks to hide a real property of the survey.
+- Rasters are large — around 40 000 × 40 000 px, 1–2 GB each.
+- `dom.tif` is present for all 79 zones; none missing.
+
+**Gaps in the delivery**, worth raising with the supplier:
+
+- `block_register.csv` and `UTM47N_Baltic1977.prj` are named as accompanying files in
+  §9 of the metadata sheet but are **not present**. The register is presumably what maps
+  each zone to its sensor (the sheet mentions B1 as L3 and B69 as L2), which this pipeline
+  needs in order to assign profiles.
+- The metadata sheet's file table lists `dem.tif`; the zones contain `dsm.tif` and
+  `dtm.tif` only.
+
+### 3.2 Open — must be verified before the code depends on it
+
+| # | Question | How it will be verified |
+|---|---|---|
+| V1 | Exact semantics of the `outputs` parameter on `/task/new` — does it restrict what `all.zip` contains, and what path format does it expect? Critical, because it is the only lever for avoiding full-archive downloads. | Read NodeODM source; confirm empirically against a running container with a tiny dataset |
+| V2 | Which ODM version is actually inside `opendronemap/nodeodm:3.5.6` and inside the current `latest` digest | `GET /info` on the running container (`engineVersion`) |
+| V3 | Is the DJI Zenmuse P1 (35 mm and 50 mm) present in ODM's sensor database, and are XMP yaw/pitch/roll read correctly? | Process a real P1 block; inspect ODM logs for unknown-camera warnings and `cameras.json` |
+| V4 | Is the L2 RGB camera (4/3 CMOS) in the sensor database? | Same method, real L2 block |
+| V5 | Actual band layout of a real ODM P1 orthophoto — band count, alpha tagging, NoData presence | `gdalinfo` / Rasterio on a real output; drives which row of the alpha decision table applies |
+| ~~V6~~ | Characteristics of a real DJI Terra DOM export | **RESOLVED — see §3.1.2** |
+| V8 | Does `PREDICTOR=2` with `BIGTIFF=YES` behave identically across the GDAL versions in ODM's container and in our packager | Round-trip a fixture and compare pixel checksums. **Half-answered:** our side round-trips RGB band checksums unchanged (`--verify-pixels`, covered by tests). The ODM-container side still needs a real ODM output. |
+| V9 | Whether L-camera RGB from a LiDAR-parameterised flight has usable overlap for ODM reconstruction | Benchmark processing on a real L2/L3 block |
+| V10 | L3 sensor specifications | Not publicly established — needs to come from you or from the acquisition metadata |
+
+Nothing in §3.2 is coded against until it is answered. Where a milestone-1 module needs one
+of these, it is written to detect and report the condition rather than to assume it.

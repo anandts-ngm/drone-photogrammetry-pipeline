@@ -1,0 +1,52 @@
+# Externally produced DJI Terra RGB / DOM — route B2.
+#
+# Not in the kickoff profile list, but required: every run manifest records a profile id,
+# version and hash, including runs that perform no reconstruction. Without this profile the
+# packaging behaviour applied to an external product (band selection, alpha policy) would
+# be undeclared and unversioned.
+#
+# No processing.odm section exists because no ODM run happens on this route.
+
+profile_id: external_terra
+# Version 2 added the radiometry.history field. The 9 Sant masters produced on 2026-08-18
+# record profile_version 1 and its hash, which remains an accurate record of what was
+# actually applied to them; only the human-readable history text is absent from those
+# manifests. Re-running Sant would add it, and would change nothing about the pixels.
+profile_version: 2
+
+sensor: null
+lens: null
+
+processing:
+  engine: DJI_TERRA
+
+radiometry:
+  # The radiometric history of a Terra export was not controlled by this repository and may
+  # not be recoverable from the file. That is recorded as a property of the product rather
+  # than left blank, and it is why Terra-derived and ODM-derived masters of the same ground
+  # are not assumed to be radiometrically comparable.
+  policy: external_uncontrolled
+  provisional: false
+
+  history: >
+    DJI Terra export with no known post-processing. Terra's own settings were outside our
+    control, so the absolute radiometry is uncontrolled, but nothing is known to have been
+    applied to the pixels afterwards. If a downstream correction WAS applied, use
+    external_terra_corrected instead: that is a different claim about the product.
+
+outputs:
+  orthophoto: true
+  dsm: false
+  point_cloud: false
+
+qa:
+  raster_contract: true
+
+packaging:
+  source_asset: null
+
+  # Left false deliberately. A Terra DOM that carries only NoData=0 as its validity signal
+  # needs a human decision, because deriving alpha from it marks legitimately black ground
+  # as invalid. Override per run with --allow-alpha-from-nodata; the product is then
+  # flagged REVIEW rather than PASS.
+  allow_alpha_from_nodata: false

@@ -1,0 +1,34 @@
+# Example block.yaml for an L3 RGB zone from the Buduunkhad delivery (XV-023222).
+#
+# Values taken from METADATA_Buduunkhad_XV-023222.txt, which is the ONLY authoritative
+# source for the vertical reference: the delivered GeoTIFFs declare EPSG:32647 and carry no
+# vertical CRS in their headers at all.
+#
+# Only the RGB orthophoto (dom.tif) is in scope here. cloud_merged.laz, dsm.tif and dtm.tif
+# come from the LiDAR path and are not produced or modified by this repository.
+
+project_id: Buduunkhad
+block_id: B1
+sensor: L3_RGB
+lens: null
+
+crs: EPSG:32647          # WGS 84 / UTM zone 47N
+
+vertical:
+  # Baltic 1977 uses NORMAL heights over a quasigeoid. It is not orthometric and it is not
+  # ellipsoidal; recording it as either would be a metre-level error.
+  height_type: NORMAL
+  epsg: 5705
+  datum_name: Baltic 1977
+  geoid_model: Mongolia Geoid 2012
+
+  # Already applied, in the field, before processing: the D-RTK 2 base height was converted
+  # to Baltic 1977 and entered into the base configuration, and every RTK/PPK solution
+  # inherited it. DJI Terra performed no vertical transformation.
+  geoid_applied: true
+
+notes: >
+  DO NOT apply any geoid model to these files. The delivered Z values are already on
+  Baltic 1977; reapplying Mongolia Geoid 2012 introduces an error of approximately 48 m.
+  Master products should declare the compound CRS EPSG:32647+5705, which adds the vertical
+  reference as metadata without altering pixels or the raster grid.

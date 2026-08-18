@@ -1,0 +1,39 @@
+# DJI Zenmuse P1, 50 mm lens — analytical master.
+#
+# Separate from p1_35 from the start. Same body, different GSD at a given altitude,
+# different overlap behaviour and different feature-matching characteristics, so the two
+# must be tunable independently even while every setting below happens to match today.
+
+profile_id: p1_50_master
+profile_version: 1
+
+sensor: P1_50
+lens: "50mm"
+
+processing:
+  engine: ODM
+  odm:
+    dsm: true
+    dtm: false
+
+radiometry:
+  policy: analytical_master
+  provisional: true
+  odm:
+    texturing-skip-global-seam-leveling: true
+    orthophoto-cutline: false
+    build-overviews: false
+    orthophoto-compression: DEFLATE
+    radiometric-calibration: none
+
+outputs:
+  orthophoto: true
+  dsm: true
+  point_cloud: true
+
+qa:
+  raster_contract: true
+
+packaging:
+  source_asset: odm_orthophoto/odm_orthophoto.tif
+  allow_alpha_from_nodata: false

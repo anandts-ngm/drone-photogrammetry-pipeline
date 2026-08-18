@@ -1,0 +1,46 @@
+# Zenmuse L2 RGB mapping camera — analytical master, ODM route (route B1).
+#
+# The LiDAR component of an L2 acquisition is out of scope for this repository entirely.
+# Only the RGB imagery is processed here.
+#
+# Whether RGB imagery from a LiDAR-parameterised flight has usable overlap for ODM
+# reconstruction is NOT yet established (docs/decisions-and-verification.md, V9). Until a
+# real L2 block has been processed and compared, route B2 (Terra DOM through
+# external_terra) remains the fallback.
+#
+# No DSM or point cloud is requested: those come from the LiDAR path, which is
+# authoritative for this sensor and is not replaced here.
+
+profile_id: l2_rgb_master
+profile_version: 1
+
+sensor: L2_RGB
+lens: null
+
+processing:
+  engine: ODM
+  odm:
+    dsm: false
+    dtm: false
+
+radiometry:
+  policy: analytical_master
+  provisional: true
+  odm:
+    texturing-skip-global-seam-leveling: true
+    orthophoto-cutline: false
+    build-overviews: false
+    orthophoto-compression: DEFLATE
+    radiometric-calibration: none
+
+outputs:
+  orthophoto: true
+  dsm: false
+  point_cloud: false
+
+qa:
+  raster_contract: true
+
+packaging:
+  source_asset: odm_orthophoto/odm_orthophoto.tif
+  allow_alpha_from_nodata: false

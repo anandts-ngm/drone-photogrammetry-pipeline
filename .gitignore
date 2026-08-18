@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+
+.env
+
+# Generated data never belongs in the repository. Source blocks never do either.
+workspace/
+runs/
+*.tif
+*.tiff
+*.laz
+*.las
+*.zip

@@ -1,0 +1,49 @@
+# Externally produced DJI Terra RGB / DOM that was radiometrically corrected afterwards.
+#
+# Separate from external_terra because the two have genuinely different radiometric
+# histories, and a product's history is the one thing about it that cannot be recovered by
+# inspecting the file. Using one profile for both would record the same claim for both, and
+# one of them would be false.
+#
+# Use external_terra for a delivery that is unmodified Terra output.
+# Use this profile when a downstream correction was applied after Terra.
+
+profile_id: external_terra_corrected
+profile_version: 1
+
+sensor: null
+lens: null
+
+processing:
+  engine: DJI_TERRA
+
+radiometry:
+  # Stronger than external_uncontrolled: not only were Terra's own settings outside our
+  # control, a further correction was applied afterwards whose settings were not recorded.
+  policy: external_corrected_uncontrolled
+  provisional: false
+
+  history: >
+    DJI Terra export, followed by a downstream radiometric correction whose settings were not
+    recorded. Measured on 2026-08-18 across 234 overlapping pairs of the Buduunkhad delivery:
+    disagreement over shared ground is about 80 percent common-mode across red, green and
+    blue (band spread 2.3 pp against a 9.3 percent median difference), and correlates with
+    sun elevation at only r=0.25 despite sun elevation spanning 38-67 degrees. The
+    differences are therefore introduced by per-block processing rather than by illumination.
+    A per-block gain solved over the overlap network reduces the median to about 3 percent.
+
+outputs:
+  orthophoto: true
+  dsm: false
+  point_cloud: false
+
+qa:
+  raster_contract: true
+
+packaging:
+  source_asset: null
+
+  # Left false deliberately, as in external_terra: a DOM whose only validity signal is
+  # NoData=0 needs a human decision, because deriving alpha from it marks legitimately black
+  # ground as invalid.
+  allow_alpha_from_nodata: false
