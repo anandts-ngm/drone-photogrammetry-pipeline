@@ -77,13 +77,33 @@ class Workspace:
         self.root = root.expanduser().resolve()
 
     def run_paths(self, project_id: str, block_id: str, run_id: str) -> RunPaths:
-        return RunPaths(self.root / project_id / block_id / "runs" / run_id)
+        return RunPaths(self.root / self.project_slug(project_id) / block_id / "runs" / run_id)
+
+    @staticmethod
+    def project_slug(project_id: str) -> str:
+        """Directory name for a project.
+
+        Lower case with underscores, so that a project written `Buduunkhad` on one command
+        line and `buduunkhad` on the next lands in one place rather than two. On a
+        case-insensitive filesystem the difference is invisible until the tree is copied to a
+        case-sensitive one, at which point it silently becomes two half-populated projects.
+        """
+        return "_".join(project_id.split()).lower()
 
     def project_dir(self, project_id: str) -> Path:
-        return self.root / project_id
+        return self.root / self.project_slug(project_id)
+
+    def reports_dir(self, project_id: str, kind: str) -> Path:
+        """Where a project-level report of a given kind lives.
+
+        Grouped by kind because these accumulate: a project that has been measured and solved
+        a few times ends up with dozens of siblings, and a flat directory gives no clue which
+        radiometry report a given harmonisation came from.
+        """
+        return self.project_dir(project_id) / "reports" / kind
 
     def promoted_master_dir(self, project_id: str, block_id: str) -> Path:
-        return self.root / project_id / block_id / "master"
+        return self.root / self.project_slug(project_id) / block_id / "master"
 
     def guard_source(self, source: Path) -> None:
         """Refuse to run if generated data would land inside the source tree.

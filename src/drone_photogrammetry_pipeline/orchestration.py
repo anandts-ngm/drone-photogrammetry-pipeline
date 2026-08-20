@@ -12,19 +12,21 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from .config import Settings
 from .integrity import sha256_file
 from .log import configure, get_logger
 from .models.enums import GateStatus, HeightType, SensorId, SourceType, WorkflowStatus
 from .models.manifest import RunManifest
-from .models.profile import load_profile
+from .models.profile import LoadedProfile, load_profile
+from .packaging.correction import BlockCorrection
 from .packaging.gdal_backend import PackagingError, PackagingPlan
 from .packaging.raster import master_filename, package_master
-from .processing.external import ExternalIngestError, ingest_external_ortho
+from .processing.external import ExternalIngestError, SourceOrtho, ingest_external_ortho
 from .qa.raster import run_raster_qa
 from .reporting.manifest import read_manifest, write_manifest, write_qa_result
-from .workspace import Workspace, make_run_id
+from .workspace import RunPaths, Workspace, make_run_id
 
 _TRAILING_NUMBER = re.compile(r"(\d+)$")
 
@@ -37,6 +39,10 @@ class IngestRequest:
     block_id: str
     profile_id: str = "external_terra"
     allow_alpha_from_nodata: bool = False
+
+    # A solved radiometric correction to apply while packaging. Kept on the request so the
+    # decision travels with everything else about the run rather than being a side channel.
+    correction: BlockCorrection | None = None
     verify_pixels: bool = False
     declare_crs: str | None = None
     height_type: HeightType = HeightType.UNKNOWN
@@ -146,35 +152,112 @@ def ingest_external_to_master(
     paths = space.run_paths(request.project_id, request.block_id, run_id)
     paths.create()
     configure(settings.log_level, paths.pipeline_log)
-    logger = get_logger("orchestration.ingest")
 
     loaded = load_profile(settings.profiles_dir, request.profile_id)
-    manifest = RunManifest(
-        run_id=run_id,
+    try:
+        ortho = ingest_external_ortho(request.source_path, request.source_type)
+    except ExternalIngestError as error:
+        manifest = RunManifest(
+            run_id=run_id,
+            project_id=request.project_id,
+            block_id=request.block_id,
+            profile_id=loaded.profile.profile_id,
+            profile_version=loaded.profile.profile_version,
+            profile_hash=loaded.profile_hash,
+            started_at=datetime.now(UTC),
+            processing_status=WorkflowStatus.FAILED,
+            finished_at=datetime.now(UTC),
+        )
+        write_manifest(paths.manifest, manifest)
+        return IngestOutcome(
+            block_id=request.block_id,
+            manifest_path=paths.manifest,
+            manifest=manifest,
+            source_bytes=source_bytes,
+            seconds=time.monotonic() - started,
+            error=str(error),
+        )
+
+    outcome = package_source_ortho(
+        ortho,
+        loaded,
+        paths,
         project_id=request.project_id,
         block_id=request.block_id,
-        sensor=request.sensor or loaded.profile.sensor,
+        run_id=run_id,
+        declare_crs=request.declare_crs,
+        height_type=request.height_type,
+        verify_pixels=request.verify_pixels,
+        sensor=request.sensor,
+        allow_alpha_from_nodata=request.allow_alpha_from_nodata,
+        source_sha256=source_sha256,
+        correction=request.correction,
+    )
+    return IngestOutcome(
+        block_id=outcome.block_id,
+        manifest_path=outcome.manifest_path,
+        manifest=outcome.manifest,
+        master_path=outcome.master_path,
+        source_bytes=source_bytes,
+        master_bytes=outcome.master_bytes,
+        seconds=time.monotonic() - started,
+        error=outcome.error,
+    )
+
+
+def package_source_ortho(
+    ortho: SourceOrtho,
+    loaded: LoadedProfile,
+    paths: RunPaths,
+    *,
+    project_id: str,
+    block_id: str,
+    run_id: str,
+    declare_crs: str | None = None,
+    height_type: HeightType = HeightType.UNKNOWN,
+    verify_pixels: bool = False,
+    sensor: SensorId | None = None,
+    allow_alpha_from_nodata: bool = False,
+    source_sha256: str | None = None,
+    correction: BlockCorrection | None = None,
+    odm_result: Any = None,
+) -> IngestOutcome:
+    """Package an orthophoto to the master contract, QA it, and write its manifest.
+
+    The single point where the two producing paths converge. An ODM product and an external
+    product reach this function in the same `SourceOrtho` shape and are treated identically
+    from here on, which is what makes them comparable.
+    """
+    logger = get_logger("orchestration.package")
+    manifest = RunManifest(
+        run_id=run_id,
+        project_id=project_id,
+        block_id=block_id,
+        sensor=sensor or loaded.profile.sensor,
         lens=loaded.profile.lens,
         profile_id=loaded.profile.profile_id,
         profile_version=loaded.profile.profile_version,
         profile_hash=loaded.profile_hash,
         started_at=datetime.now(UTC),
         processing_status=WorkflowStatus.PACKAGING,
-        height_type=request.height_type,
+        height_type=height_type,
         radiometry_policy=loaded.profile.radiometry.policy,
         radiometry_history=loaded.profile.radiometry.history,
+        source_type=ortho.source_type,
+        processing_engine=ortho.processing_engine,
+        crs=ortho.crs,
     )
+    if odm_result is not None:
+        manifest.nodeodm_task_id = odm_result.task_uuid
+        manifest.nodeodm_version = odm_result.nodeodm_version
+        manifest.odm_version = odm_result.odm_version
+        manifest.image_count = odm_result.task_info.imagesCount
     logger.info(
-        "run started",
-        extra={"run_id": run_id, "block_id": request.block_id, "source": str(request.source_path)},
+        "packaging started",
+        extra={"run_id": run_id, "block_id": block_id, "source": str(ortho.path)},
     )
 
     try:
-        ortho = ingest_external_ortho(request.source_path, request.source_type)
-        manifest.source_type = ortho.source_type
-        manifest.processing_engine = ortho.processing_engine
-        manifest.crs = ortho.crs
-
         spec = loaded.profile.packaging
         selection = spec.band_selection
         plan = PackagingPlan(
@@ -183,14 +266,13 @@ def ingest_external_to_master(
                 if selection and len(selection) == 3
                 else None
             ),
-            allow_alpha_from_nodata=(
-                request.allow_alpha_from_nodata or spec.allow_alpha_from_nodata
-            ),
-            verify_pixels=request.verify_pixels,
-            declare_crs=request.declare_crs,
+            allow_alpha_from_nodata=(allow_alpha_from_nodata or spec.allow_alpha_from_nodata),
+            verify_pixels=verify_pixels,
+            declare_crs=declare_crs,
+            correction=correction,
         )
 
-        destination = paths.master_dir / master_filename(request.block_id)
+        destination = paths.master_dir / master_filename(block_id)
         result = package_master(ortho.path, destination, plan=plan, source_sha256=source_sha256)
         manifest.packaging = result.record
         manifest.pixel_size_x = result.description.pixel_size_x
@@ -206,17 +288,15 @@ def ingest_external_to_master(
         manifest.outputs = {"orthophoto_master": str(destination)}
         manifest.output_hashes = {"orthophoto_master": sha256_file(destination)}
         manifest.processing_status = WorkflowStatus.QA_COMPLETE
-    except (ExternalIngestError, PackagingError) as error:
+    except PackagingError as error:
         manifest.processing_status = WorkflowStatus.FAILED
         manifest.finished_at = datetime.now(UTC)
         write_manifest(paths.manifest, manifest)
         logger.exception("run failed", extra={"run_id": run_id, "error": str(error)})
         return IngestOutcome(
-            block_id=request.block_id,
+            block_id=block_id,
             manifest_path=paths.manifest,
             manifest=manifest,
-            source_bytes=source_bytes,
-            seconds=time.monotonic() - started,
             error=str(error),
         )
 
@@ -225,11 +305,9 @@ def ingest_external_to_master(
     logger.info("run complete", extra={"run_id": run_id, "gate_status": manifest.gate_status.value})
 
     return IngestOutcome(
-        block_id=request.block_id,
+        block_id=block_id,
         manifest_path=paths.manifest,
         manifest=manifest,
         master_path=destination,
-        source_bytes=source_bytes,
         master_bytes=destination.stat().st_size,
-        seconds=time.monotonic() - started,
     )

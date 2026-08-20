@@ -126,6 +126,82 @@ Extrapolated over 79 zones: roughly 2.5 hours, and the output set is about **70 
 92 GiB of input**. A byte-copy fast path would consume the full 92 GiB and save nothing, so
 it is not worth the second code path.
 
+### 2.8 Output location — **DECIDED: `C:\PHOTOGRAMMETRY_OUTPUTS`**
+
+Products were previously written to `C:\MINING_PIPELINE_WORKSPACE`, a name that says nothing
+about what produced them and sits one letter from `C:\MINING_PIPELINE_WORK` — a *different*
+pipeline (satellite/ASTER, KOMPSAT, regional GIS) covering the same licence area. Two
+similarly-named roots, one of which this repository rebuilds wholesale, is a mistake waiting
+to happen. The new name states the producing discipline, so a rebuild can never be aimed at
+the GIS pipeline's products by accident.
+
+Set per machine via `DPP_WORKSPACE_ROOT` in a gitignored `.env`, because it is a property of
+the workstation rather than of the project.
+
+The old root was deleted (108.5 GiB) after confirming both projects were regenerable: the
+Buduunkhad sources are present, and the Sant sources were located at
+`nergui_undur/sant/l_drone/N1..N9` — the manifests record `nergui-undur` with a hyphen, so
+the folder was renamed after processing and a path-only check would have wrongly concluded
+the sources were gone. The radiometry and harmonisation reports (1.65 MB) were preserved
+first: they are measurements, not products, and re-deriving the pre-replacement baseline
+would require restoring superseded source files.
+
+### 2.9 Terrain data for topographic correction — **DECIDED: per-block `dtm.tif`**
+
+The GIS pipeline has already produced 15 terrain derivatives at 0.5 m over the whole licence
+area (slope, aspect, TPI, TRI, roughness, plan/profile curvature, LRM at 10/25/50 m, four
+hillshades). Reusing them was considered and rejected *for this repository*, for two reasons.
+
+They exist only inside that pipeline's run staging
+(`work/runs/<uuid>/staging/05/03_Raster_Products`) with no stable published copy, so
+depending on the path couples this pipeline's correctness to another pipeline's garbage
+collection. And each delivered block already ships its own `dtm.tif` — 79 files, 485 MB
+total, already an input here — on the block's own grid, so slope and aspect derived from it
+need no resampling to line up with the orthophoto they correct.
+
+The mosaicked derivatives remain the better choice for the *lithology feature stack*, where
+multi-scale descriptors (TRI, TPI, LRM) are genuinely expensive to recompute and grid
+alignment across blocks is a feature rather than a hazard. That is the ML dataset's concern,
+not this repository's.
+
+### 2.10 Gain versus gain+offset — **DECIDED: gain only, on physical grounds**
+
+Measured in linear light, an affine model fits the matched quantiles far better than a pure
+scale: per pair, `scale` leaves 10.03% and `gain+offset` leaves 2.99%. A single gain gets a
+pair under 5% only 28.7% of the time, and the ratio `qq_b/qq_a` drifts a median 25% across
+the quantile range, so the blocks genuinely do not differ by a scale factor alone.
+
+The network solve cannot realise most of that: one coefficient pair per block instead of per
+pair takes it from 2.99% to 7.4%, against 9.6% for gain only on the same metric and weighting.
+
+It is nonetheless refused, because of how it buys the improvement. The solved offsets reach
+-55 DN in linear terms, and the correction `gain * value + offset` clips at zero: **107 of
+237 block-bands drive some shadow to pure black, and 45 of them crush everything below DN
+60**. B55 red loses everything under DN 122 — close to half the tonal range. The quantile
+residual improves because the sampled levels start at the 5th percentile and never see what
+was destroyed below it.
+
+This is a metric improving while the product gets worse, and for a lithology model the
+crushed region is exactly the shaded rock face where the reading is hardest. Gain only stays.
+
+If offsets are revisited, they must be constrained so that `gain * min_linear + offset >= 0`
+per block, which is also the physically sensible bound: an offset models additive path
+radiance, and no correction should subtract more light than the darkest pixel contains.
+
+An earlier version of this comparison, measured on gamma-encoded values, reported that
+gain+offset bought only 0.3-0.7 pp for +-135 DN. That number was misleading — the offset was
+absorbing tone-curve curvature rather than a black level — but its conclusion was right for a
+reason it had not identified.
+
+### 2.11 Weighting applied consistently across models
+
+`solve_gains` weighted its constraints by the square root of the sample count; the gain and
+offset solves inside `solve_gain_offset` did not. Every comparison between the two models was
+therefore a comparison of two changes at once, and the weighting mattered more than the model:
+unweighted gain-only left 10.1% where weighted gain-only left 6.4%, so an unweighted
+gain+offset at 8.0% could look like an improvement while being worse than the solution
+actually deployed. Both solves are now weighted on the same basis.
+
 ### 2.6 Deviations from the proposed repository tree
 
 Six small additions, each with a reason, listed in `milestone-1-plan.md` §2. Flagged here
@@ -208,12 +284,52 @@ Other measurements:
 - The metadata sheet's file table lists `dem.tif`; the zones contain `dsm.tif` and
   `dtm.tif` only.
 
+### 3.1.3 Buduunkhad radiometric provenance — 2026-08-18
+
+A `BH_L2_20260704_B64` DJI Terra quality report was supplied, the first available for
+Buduunkhad. It settles two things and retires a claim this repository had briefly recorded.
+
+| Finding | Source |
+|---|---|
+| DJI Terra **V5.2.5**, mission `BH_L2_20260704_B64` | report header |
+| Payload **DJI Zenmuse L2**, SN 6U3DN6H0050PGJ — B64's sensor is now recorded, not inferred | Mission Parameters |
+| **TDOM GSD 3.82 cm/px**, coverage 0.735 km² — the delivered `dom.tif` measures 3.81 cm, so it *is* the Terra output at its native grid | Output Preview |
+| **No colour, white-balance, exposure or radiometric parameter appears anywhere** in the Reconstruction Parameters. Terra's LiDAR 2D-map workflow exposes point-cloud density, accuracy optimisation, smoothing, ground classification, DEM and output CRS only | Reconstruction Parameters |
+| Two flights, 2 flight strips, average overlap **26.97 %**, flight heights 81.0 m and 82.7 m | Mission / Flight Strip Accuracy |
+| POS Fix 100 %, **PPK Fix 100 %**; 4 check points, point-cloud RMSE 0.067 m | Accuracy Parameters |
+| Output CRS `WGS 84 / UTM zone 47N`, geoid **Default** — matches the delivery metadata's account | Point Cloud Output Parameters |
+
+**Consequence.** Because Terra exposes no radiometric setting, a re-export with the same
+inputs is deterministic and cannot differ. The four-block re-export pilot was therefore
+cancelled: it could not have produced new information.
+
+**A claim was retired.** On the strength of an earlier reading that Buduunkhad was "Terra
+output, corrected afterwards", a profile `external_terra_corrected` was created asserting
+`external_corrected_uncontrolled`, and a project run began stamping it into every manifest.
+That run was stopped at 20 of 79 and those runs discarded, the profile deleted, and the
+project re-run under `external_terra`. No downstream correction is established, so none is
+claimed.
+
+What remains genuinely unknown is whether the delivered pixels are *byte-identical* to
+Terra's output. A colour-only correction would preserve GSD and extent, so the matching GSD
+does not exclude one. Settling it would need one re-exported block compared pixel-for-pixel;
+that was judged not worth doing, so the manifests claim only what is supported: a Terra
+export with no known post-processing.
+
+**A hypothesis that failed, recorded so it is not retried.** The two-flight composition of
+B64 suggested that within-block illumination change might explain the residual a per-block
+gain cannot remove. It does not. Across 79 blocks the residual correlates with acquisition
+time span at r = −0.02, coverage depth r = +0.04, sun elevation r = −0.23 and overlap count
+r = +0.11. B32 spans 88 minutes with a 0.7 % residual; B17 spans 29 minutes with 8.1 %. The
+3.0 % median residual sits near the ~2.2 % floor that B64/B66 reach naturally, so it may
+simply be the measurement floor rather than a correctable effect.
+
 ### 3.2 Open — must be verified before the code depends on it
 
 | # | Question | How it will be verified |
 |---|---|---|
-| V1 | Exact semantics of the `outputs` parameter on `/task/new` — does it restrict what `all.zip` contains, and what path format does it expect? Critical, because it is the only lever for avoiding full-archive downloads. | Read NodeODM source; confirm empirically against a running container with a tiny dataset |
-| V2 | Which ODM version is actually inside `opendronemap/nodeodm:3.5.6` and inside the current `latest` digest | `GET /info` on the running container (`engineVersion`) |
+| ~~V1~~ | Semantics of the `outputs` parameter | **RESOLVED.** NodeODM's API definition: *"An optional serialized JSON string of paths relative to the project directory that should be included in the all.zip result file, overriding the default behavior."* Exactly the lever needed. The client sends it as a JSON array of paths. Still worth an empirical check against a running node with a tiny dataset. |
+| V2 | Which ODM version is actually inside the pinned digest | `GET /info` on the running container (`engineVersion`). The compose file now pins `opendronemap/nodeodm@sha256:8845ee48…` (`latest` as resolved 2026-08-18), and every run records `engineVersion` in its manifest, so what actually ran is always known regardless of what the compose file says. |
 | V3 | Is the DJI Zenmuse P1 (35 mm and 50 mm) present in ODM's sensor database, and are XMP yaw/pitch/roll read correctly? | Process a real P1 block; inspect ODM logs for unknown-camera warnings and `cameras.json` |
 | V4 | Is the L2 RGB camera (4/3 CMOS) in the sensor database? | Same method, real L2 block |
 | V5 | Actual band layout of a real ODM P1 orthophoto — band count, alpha tagging, NoData presence | `gdalinfo` / Rasterio on a real output; drives which row of the alpha decision table applies |

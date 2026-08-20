@@ -1,9 +1,4 @@
-"""The block.yaml contract.
-
-The filesystem inventory model and the scanner that builds it arrive in Phase 3 with
-`ingest/`. This module defines only what a block declares about itself, which packaging
-already needs in order to label a product.
-"""
+"""What a block is: what it declares about itself, and what is actually on disk."""
 
 from __future__ import annotations
 
@@ -12,7 +7,7 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field
 
-from .enums import HeightType, SensorId
+from .enums import HeightType, SensorId, ValidationSeverity
 
 
 class VerticalReference(BaseModel):
@@ -63,3 +58,60 @@ def load_block_config(path: Path) -> BlockConfig:
     if not isinstance(raw, dict):
         raise ValueError(f"block config {path} must contain a YAML mapping")
     return BlockConfig.model_validate(raw)
+
+
+class Block(BaseModel):
+    """What was found on disk for one block. A pure inventory — it judges nothing."""
+
+    block_id: str
+    root: Path
+    layout: str
+    config: BlockConfig | None = None
+
+    images: list[Path] = Field(default_factory=list)
+    navigation: list[Path] = Field(default_factory=list)
+    control: list[Path] = Field(default_factory=list)
+    checkpoints: list[Path] = Field(default_factory=list)
+    reference: list[Path] = Field(default_factory=list)
+
+    @property
+    def image_count(self) -> int:
+        return len(self.images)
+
+
+class ValidationFinding(BaseModel):
+    """One expectation about a block, and what was actually found."""
+
+    name: str
+    severity: ValidationSeverity
+    detail: str = ""
+
+    @property
+    def is_fatal(self) -> bool:
+        return self.severity is ValidationSeverity.MISSING_FATAL
+
+
+class ValidatedBlock(BaseModel):
+    """A block that has been through validation.
+
+    Deliberately a distinct type from `Block`. A function that requires validated input
+    should be unable to accept unvalidated input by construction rather than by convention.
+    """
+
+    block: Block
+    findings: list[ValidationFinding] = Field(default_factory=list)
+
+    # Recorded rather than inferred later: a block whose vertical reference is undeclared can
+    # still be processed, but nothing downstream may claim an absolute-Z result for it.
+    suitable_for_absolute_z: bool = False
+
+    @property
+    def fatal(self) -> list[ValidationFinding]:
+        return [finding for finding in self.findings if finding.is_fatal]
+
+    @property
+    def is_processable(self) -> bool:
+        return not self.fatal
+
+    def of_severity(self, severity: ValidationSeverity) -> list[ValidationFinding]:
+        return [finding for finding in self.findings if finding.severity is severity]

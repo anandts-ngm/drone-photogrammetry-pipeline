@@ -50,7 +50,7 @@ def run(root: Path, *extra: str) -> Result:
 
 
 def read_summary(tmp_path: Path) -> dict[str, Any]:
-    summaries = list((tmp_path / "workspace").rglob("run-project_*.json"))
+    summaries = list((tmp_path / "workspace").rglob("run_project_*.json"))
     assert summaries, "no project summary was written"
     document: dict[str, Any] = json.loads(sorted(summaries)[-1].read_text(encoding="utf-8"))
     return document

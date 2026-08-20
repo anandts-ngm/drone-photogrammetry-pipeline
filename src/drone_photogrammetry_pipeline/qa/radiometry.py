@@ -39,12 +39,19 @@ from numpy.typing import NDArray
 from rasterio.enums import Resampling
 from rasterio.windows import from_bounds
 
+from ..colour import dn_to_linear
 from ..models.qa import BandDifference, RadiometricOverlapReport, RadiometricPairResult
 
 BAND_NAMES = ("red", "green", "blue")
 PATCH_GRID = 32
 DEFAULT_PATCHES = 48
 DEFAULT_PATCH_METRES = 4.0
+
+# Percentile levels at which the two blocks' distributions are matched. Spread across the
+# range rather than clustered at the middle, because the question a single median cannot
+# answer is whether the blocks differ by a scale factor or by a black level, and only the
+# dark end distinguishes those two.
+QQ_LEVELS = (5.0, 10.0, 25.0, 50.0, 75.0, 90.0, 95.0)
 
 # After averaging, a patch edge that clipped the block boundary has fractional alpha. Only
 # fully covered ground is compared.
@@ -121,18 +128,45 @@ def _patch_origins(
             )
 
 
+def _bin_average(data: NDArray[Any], size: int) -> NDArray[np.float64]:
+    """Average a patch down to `size` x `size` by block mean, in full.
+
+    Done here rather than by asking GDAL for a smaller `out_shape`, because that request is
+    served from the overview pyramid when one exists. A measurement that changes when someone
+    adds pyramids for viewing is not a measurement; this keeps the answer a property of the
+    imagery alone.
+    """
+    bands, height, width = data.shape
+    rows, columns = height // size, width // size
+    trimmed = data[:, : rows * size, : columns * size]
+    return trimmed.reshape(bands, size, rows, size, columns).mean(axis=(2, 4)).astype(np.float64)
+
+
 def _read_patch(dataset: Any, box: tuple[float, float, float, float]) -> NDArray[Any] | None:
     window = from_bounds(*box, transform=dataset.transform)
     if window.width < 1 or window.height < 1:
         return None
-    data = dataset.read(
-        indexes=[1, 2, 3, 4],
-        window=window,
-        out_shape=(4, PATCH_GRID, PATCH_GRID),
-        resampling=Resampling.average,
-        boundless=False,
+
+    # Full-resolution read. A ground patch is a few metres across, so even at 2.5 cm this is
+    # a couple of hundred pixels a side -- cheap enough that avoiding the overview path costs
+    # nothing worth measuring.
+    data = np.asarray(
+        dataset.read(indexes=[1, 2, 3, 4], window=window, boundless=False), dtype=np.float64
     )
-    return np.asarray(data, dtype=np.float64)
+    if data.shape[1] < PATCH_GRID or data.shape[2] < PATCH_GRID:
+        # Coarser than the target grid, so there is nothing to average down; resampling up
+        # reads full resolution regardless of what pyramids exist.
+        return np.asarray(
+            dataset.read(
+                indexes=[1, 2, 3, 4],
+                window=window,
+                out_shape=(4, PATCH_GRID, PATCH_GRID),
+                resampling=Resampling.average,
+                boundless=False,
+            ),
+            dtype=np.float64,
+        )
+    return _bin_average(data, PATCH_GRID)
 
 
 def compare_pair(
@@ -141,6 +175,7 @@ def compare_pair(
     *,
     patches: int = DEFAULT_PATCHES,
     patch_metres: float = DEFAULT_PATCH_METRES,
+    linearise: bool = False,
 ) -> RadiometricPairResult:
     # Checked before the bounds, because comparing coordinates expressed in two different
     # reference systems is meaningless rather than merely inaccurate.
@@ -195,6 +230,15 @@ def compare_pair(
     stacked_a = np.concatenate(samples_a, axis=1)
     stacked_b = np.concatenate(samples_b, axis=1)
 
+    # Linearising here rather than at read time means every statistic below -- medians,
+    # quantiles and the robust ratio alike -- describes light rather than display values, so
+    # the gain solved from them is a gain in radiance. Deliveries are display-referred sRGB;
+    # a scale factor in radiance is only a scale factor in encoded values where the encoding
+    # is a pure power law, which sRGB is not near black. See `colour`.
+    if linearise:
+        stacked_a = dn_to_linear(stacked_a)
+        stacked_b = dn_to_linear(stacked_b)
+
     bands = []
     for index, name in enumerate(BAND_NAMES):
         va, vb = stacked_a[index], stacked_b[index]
@@ -217,6 +261,8 @@ def compare_pair(
                 median_difference=median_b - median_a,
                 relative_difference_pct=relative,
                 robust_normalized_difference_pct=robust,
+                qq_a=[float(v) for v in np.percentile(va, QQ_LEVELS)],
+                qq_b=[float(v) for v in np.percentile(vb, QQ_LEVELS)],
             )
         )
 
@@ -238,6 +284,7 @@ def measure_project(
     min_overlap_ha: float = 1.0,
     patches: int = DEFAULT_PATCHES,
     patch_metres: float = DEFAULT_PATCH_METRES,
+    linearise: bool = False,
     progress: Any = None,
 ) -> RadiometricOverlapReport:
     footprints = read_footprints(blocks)
@@ -250,7 +297,7 @@ def measure_project(
 
     results = []
     for index, (a, b) in enumerate(candidates, start=1):
-        result = compare_pair(a, b, patches=patches, patch_metres=patch_metres)
+        result = compare_pair(a, b, patches=patches, patch_metres=patch_metres, linearise=linearise)
         results.append(result)
         if progress is not None:
             progress(index, len(candidates), result)
@@ -260,5 +307,7 @@ def measure_project(
         generated_at=datetime.now(UTC),
         pair_count=len(candidates),
         measured_count=sum(1 for r in results if r.sample_pixels > 0),
+        qq_levels=list(QQ_LEVELS),
+        linearised=linearise,
         pairs=results,
     )

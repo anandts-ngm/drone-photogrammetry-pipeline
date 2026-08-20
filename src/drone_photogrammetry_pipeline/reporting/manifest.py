@@ -47,14 +47,24 @@ def write_harmonisation(path: Path, solution: HarmonisationSolution) -> Path:
     return path
 
 
-def write_harmonisation_gains_csv(path: Path, solution: HarmonisationSolution) -> Path:
-    """A flat table for consumers that apply the gains themselves.
+def read_harmonisation_solution(path: Path) -> HarmonisationSolution:
+    return HarmonisationSolution.model_validate_json(path.read_text(encoding="utf-8"))
 
-    The overlap count and residual travel with each row on purpose: a coefficient solved from
-    three overlaps deserves less trust than one solved from eight, and a reader who only sees
+
+def write_harmonisation_gains_csv(path: Path, solution: HarmonisationSolution) -> Path:
+    """A flat table for consumers that apply the coefficients themselves.
+
+    Every column a correct application needs travels with the row. In particular the offsets
+    are written whenever the solution has them: a gain from a joint gain-and-offset fit is
+    NOT a gain-only correction, and applying it without its offset is measurably worse than
+    applying nothing at all. `model` says which of the two a row belongs to.
+
+    The overlap count and residual are here for the same reason: a coefficient solved from
+    three overlaps deserves less trust than one solved from eight, and a reader who sees only
     the number cannot know that.
     """
     bands = list(solution.blocks[0].gains) if solution.blocks else []
+    has_offsets = any(block.offsets for block in solution.blocks)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -62,7 +72,9 @@ def write_harmonisation_gains_csv(path: Path, solution: HarmonisationSolution) -
             [
                 "project",
                 "block",
+                "model",
                 *(f"gain_{band}" for band in bands),
+                *(f"offset_{band}" for band in bands if has_offsets),
                 "overlap_count",
                 "component",
                 "residual_pct",
@@ -71,10 +83,14 @@ def write_harmonisation_gains_csv(path: Path, solution: HarmonisationSolution) -
             ]
         )
         for block in solution.blocks:
+            offsets = block.offsets or {}
             writer.writerow(
-                [solution.project_id, block.block_id]
-                + [f"{block.gains[band]:.5f}" for band in bands]
-                + [
+                [
+                    solution.project_id,
+                    block.block_id,
+                    solution.model,
+                    *(f"{block.gains[band]:.5f}" for band in bands),
+                    *(f"{offsets.get(band, 0.0):.3f}" for band in bands if has_offsets),
                     block.overlap_count,
                     block.component,
                     "" if block.residual_pct is None else f"{block.residual_pct:.2f}",

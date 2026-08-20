@@ -16,31 +16,47 @@ from rich.table import Table
 
 from . import __version__
 from .config import get_settings
-from .harmonisation import HarmonisationError, solve_gains
-from .log import console, error_console
-from .models.enums import CheckOutcome, GateStatus, HeightType, SensorId, SourceType
+from .harmonisation import HarmonisationError, solve_gain_offset, solve_gains
+from .ingest.scan import scan_block
+from .ingest.validate import validate_block
+from .log import configure, console, error_console
+from .models.enums import (
+    CheckOutcome,
+    GateStatus,
+    HeightType,
+    SensorId,
+    SourceType,
+    ValidationSeverity,
+)
 from .models.harmonisation import HarmonisationSolution
 from .models.manifest import BlockRunSummary, ProjectRunSummary
+from .models.profile import load_profile
 from .models.qa import RadiometricOverlapReport, RadiometricPairResult, RasterQAResult
+from .nodeodm.client import NodeODMClient, NodeODMError
 from .orchestration import (
     IngestOutcome,
     IngestRequest,
     discover_blocks,
     ingest_external_to_master,
+    natural_key,
+    package_source_ortho,
 )
+from .packaging.correction import correction_for
 from .packaging.gdal_backend import PackagingError, PackagingPlan
 from .packaging.raster import package_master
+from .processing.odm import OdmProcessingError, retrieve, source_ortho, submit
 from .qa.radiometry import DEFAULT_PATCH_METRES, DEFAULT_PATCHES, measure_project
 from .qa.raster import run_raster_qa
 from .reporting.manifest import (
     latest_radiometry_report,
+    read_harmonisation_solution,
     read_radiometry_report,
     write_harmonisation,
     write_harmonisation_gains_csv,
     write_project_summary,
     write_radiometry_report,
 )
-from .workspace import Workspace
+from .workspace import Workspace, make_run_id
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -71,6 +87,11 @@ _GIB = 1024**3
 
 class ExternalSource(StrEnum):
     TERRA = "terra"
+
+
+class HarmonisationModel(StrEnum):
+    GAIN = "gain"
+    GAIN_OFFSET = "gain-offset"
 
 
 _SOURCE_TYPES = {ExternalSource.TERRA: SourceType.DJI_TERRA}
@@ -160,6 +181,161 @@ def ingest_ortho(
     raise typer.Exit(_EXIT_FOR_STATUS[outcome.gate_status])
 
 
+@app.command()
+def validate(
+    root: Annotated[Path, typer.Argument(exists=True, file_okay=False, help="Block directory.")],
+) -> None:
+    """Inventory a block and report what is present, missing, or missing and fatal."""
+    block = scan_block(root)
+    validated = validate_block(block)
+
+    console().print(
+        f"[bold]{block.block_id}[/bold]  layout={block.layout}  "
+        f"{block.image_count} images, {len(block.navigation)} navigation, "
+        f"{len(block.control)} control, {len(block.checkpoints)} check points"
+    )
+
+    colour = {
+        ValidationSeverity.REQUIRED_PRESENT: "green",
+        ValidationSeverity.OPTIONAL_MISSING: "dim",
+        ValidationSeverity.MISSING_ACCEPTABLE: "yellow",
+        ValidationSeverity.MISSING_FATAL: "red",
+    }
+    table = Table(title=f"Validation: {block.block_id}")
+    table.add_column("check")
+    table.add_column("severity")
+    table.add_column("detail")
+    for finding in validated.findings:
+        shade = colour[finding.severity]
+        table.add_row(finding.name, f"[{shade}]{finding.severity.value}[/{shade}]", finding.detail)
+    console().print(table)
+
+    if not validated.suitable_for_absolute_z:
+        console().print(
+            "[yellow]not suitable for absolute-Z QA[/yellow]: no vertical reference is "
+            "declared, so no downstream step may claim an absolute height result"
+        )
+    if not validated.is_processable:
+        error_console().print("[bold red]NOT PROCESSABLE[/bold red]")
+        raise typer.Exit(EXIT_FAIL)
+    console().print("[green]processable[/green]")
+    raise typer.Exit(EXIT_PASS)
+
+
+@app.command()
+def process(
+    root: Annotated[Path, typer.Argument(exists=True, file_okay=False, help="Block directory.")],
+    profile_id: Annotated[str, typer.Option("--profile", help="Processing profile id.")],
+    node_url: Annotated[
+        str | None, typer.Option("--node", help="NodeODM base URL; defaults to settings.")
+    ] = None,
+) -> None:
+    """Submit a block to NodeODM for reconstruction. Returns immediately with the task id."""
+    settings = get_settings()
+    validated = validate_block(scan_block(root))
+    loaded = load_profile(settings.profiles_dir, profile_id)
+
+    with NodeODMClient(node_url or settings.nodeodm_url) as client:
+        if not client.health():
+            error_console().print(
+                f"no NodeODM at {node_url or settings.nodeodm_url}; "
+                "run 'docker compose up -d' first"
+            )
+            raise typer.Exit(EXIT_FAIL)
+        node = client.info()
+        try:
+            uuid = submit(validated, loaded.profile, client)
+        except (OdmProcessingError, NodeODMError) as error:
+            error_console().print(f"[bold red]FAILED[/bold red] {error}")
+            raise typer.Exit(EXIT_FAIL) from error
+
+    console().print(f"engine:  {node.engine} {node.engineVersion} (NodeODM {node.version})")
+    console().print(f"task:    {uuid}")
+    console().print(f"monitor: drone-photo status {uuid}")
+
+
+@app.command()
+def status(
+    task_uuid: Annotated[str, typer.Argument(help="NodeODM task id.")],
+    node_url: Annotated[str | None, typer.Option("--node")] = None,
+    follow: Annotated[
+        bool, typer.Option("--follow", help="Poll until the task reaches a terminal state.")
+    ] = False,
+) -> None:
+    """Report a task's progress, optionally following it to completion."""
+    settings = get_settings()
+    with NodeODMClient(node_url or settings.nodeodm_url) as client:
+        try:
+            if follow:
+                info = client.wait(
+                    task_uuid,
+                    poll_seconds=15.0,
+                    on_progress=lambda i: console().print(
+                        f"  {i.progress:5.1f}%  {i.code.name if i.code else 'UNKNOWN'}"
+                    ),
+                )
+            else:
+                info = client.task_info(task_uuid)
+        except NodeODMError as error:
+            error_console().print(f"[bold red]FAILED[/bold red] {error}")
+            raise typer.Exit(EXIT_FAIL) from error
+
+    state = info.code.name if info.code else "UNKNOWN"
+    console().print(f"{task_uuid}  {state}  {info.progress:.1f}%  images={info.imagesCount}")
+    if info.status.errorMessage:
+        error_console().print(f"error: {info.status.errorMessage}")
+    raise typer.Exit(EXIT_PASS if info.is_success else EXIT_FAIL)
+
+
+@app.command()
+def fetch(
+    task_uuid: Annotated[str, typer.Argument(help="NodeODM task id.")],
+    project_id: Annotated[str, typer.Option("--project-id")],
+    block_id: Annotated[str, typer.Option("--block-id")],
+    profile_id: Annotated[str, typer.Option("--profile")],
+    node_url: Annotated[str | None, typer.Option("--node")] = None,
+    declare_crs: Annotated[str | None, typer.Option("--declare-crs")] = None,
+    height_type: Annotated[HeightType, typer.Option("--height-type")] = HeightType.UNKNOWN,
+    verify_pixels: Annotated[bool, typer.Option("--verify-pixels")] = False,
+) -> None:
+    """Download a finished task, package its orthophoto and run QA."""
+    settings = get_settings()
+    workspace = Workspace(settings.workspace_root)
+    loaded = load_profile(settings.profiles_dir, profile_id)
+
+    run_id = make_run_id(block_id)
+    paths = workspace.run_paths(project_id, block_id, run_id)
+    paths.create()
+    configure(settings.log_level, paths.pipeline_log)
+
+    with NodeODMClient(node_url or settings.nodeodm_url) as client:
+        try:
+            result = retrieve(task_uuid, loaded.profile, client, engine_dir=paths.engine_dir)
+            ortho = source_ortho(result, loaded.profile)
+        except (OdmProcessingError, NodeODMError) as error:
+            error_console().print(f"[bold red]FAILED[/bold red] {error}")
+            raise typer.Exit(EXIT_FAIL) from error
+
+    outcome = package_source_ortho(
+        ortho,
+        loaded,
+        paths,
+        project_id=project_id,
+        block_id=block_id,
+        run_id=run_id,
+        declare_crs=declare_crs,
+        height_type=height_type,
+        verify_pixels=verify_pixels,
+        odm_result=result,
+    )
+    if outcome.manifest is not None and outcome.manifest.raster_qa is not None:
+        _render_qa(outcome.manifest.raster_qa)
+    console().print(f"engine:   odm {result.odm_version}")
+    console().print(f"master:   {outcome.master_path}")
+    console().print(f"manifest: {outcome.manifest_path}")
+    raise typer.Exit(_EXIT_FOR_STATUS[outcome.gate_status])
+
+
 @app.command("run-project")
 def run_project(
     root: Annotated[
@@ -194,6 +370,18 @@ def run_project(
         bool,
         typer.Option("--force", help="Reprocess blocks that already have a completed run."),
     ] = False,
+    harmonisation: Annotated[
+        Path | None,
+        typer.Option(
+            "--harmonise-with",
+            exists=True,
+            dir_okay=False,
+            help=(
+                "Harmonisation solution to apply while packaging. Gains are applied in the "
+                "space the solution declares. Incompatible with --verify-pixels."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Package every block under a project directory to the master contract.
 
@@ -210,6 +398,30 @@ def run_project(
         raise typer.Exit(EXIT_FAIL)
     if limit is not None:
         blocks = blocks[:limit]
+
+    # Checked before any block is read. The backend refuses this combination too, but by then
+    # it has hashed a multi-gigabyte source, and over 79 blocks that is an hour spent to learn
+    # something knowable from the arguments alone.
+    if harmonisation is not None and verify_pixels:
+        error_console().print(
+            "[bold red]--verify-pixels and --harmonise-with are contradictory[/bold red]: "
+            "verification asserts the pixels are unchanged, correction changes them"
+        )
+        raise typer.Exit(EXIT_FAIL)
+
+    solution = None
+    if harmonisation is not None:
+        solution = read_harmonisation_solution(harmonisation)
+        solved = {b.block_id for b in solution.blocks}
+        unsolved = sorted({block_id for block_id, _ in blocks} - solved, key=natural_key)
+        console().print(
+            f"correcting with {harmonisation.name}: "
+            f"[bold]{solution.space.value}[/bold] space, {len(solved)} blocks solved"
+        )
+        # Named rather than counted. A block with no measured overlap is packaged unchanged,
+        # and which blocks those are decides whether the set is seamless or merely mostly so.
+        if unsolved:
+            console().print(f"[yellow]uncorrected (not in solution): {' '.join(unsolved)}[/yellow]")
 
     console().print(f"[bold]{project_id}[/bold]: {len(blocks)} blocks from {root}")
     started_at = datetime.now(UTC)
@@ -228,6 +440,7 @@ def run_project(
                 declare_crs=declare_crs,
                 height_type=height_type,
                 sensor=sensor,
+                correction=(correction_for(solution, block_id) if solution is not None else None),
             ),
             settings,
             workspace=workspace,
@@ -246,7 +459,7 @@ def run_project(
     )
     stamp = started_at.strftime("%Y%m%dT%H%M%SZ")
     summary_path = write_project_summary(
-        workspace.project_dir(project_id) / f"run-project_{stamp}.json", summary
+        workspace.reports_dir(project_id, "runs") / f"run_project_{stamp}.json", summary
     )
 
     _render_project_summary(summary, summary_path)
@@ -275,6 +488,17 @@ def radiometry(
     patch_metres: Annotated[
         float, typer.Option("--patch-metres", help="Side length of each ground patch.")
     ] = DEFAULT_PATCH_METRES,
+    linearise: Annotated[
+        bool,
+        typer.Option(
+            "--linearise/--no-linearise",
+            help=(
+                "Invert the sRGB transfer function before measuring, so the numbers describe "
+                "light rather than display values. A gain solved from linearised medians is a "
+                "gain in radiance."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Measure how much overlapping blocks disagree radiometrically.
 
@@ -312,11 +536,16 @@ def radiometry(
         min_overlap_ha=min_overlap_ha,
         patches=patches,
         patch_metres=patch_metres,
+        linearise=linearise,
         progress=show,
     )
     stamp = report.generated_at.strftime("%Y%m%dT%H%M%SZ")
+    # The filename carries the encoding because a linear and an encoded report are not
+    # interchangeable inputs to `harmonise`, and the difference is invisible in the numbers.
+    suffix = "_linear" if linearise else ""
     path = write_radiometry_report(
-        workspace.project_dir(project_id) / f"radiometry_{stamp}.json", report
+        workspace.reports_dir(project_id, "radiometry") / f"radiometry_{stamp}{suffix}.json",
+        report,
     )
     _render_radiometry(report, path)
 
@@ -335,6 +564,16 @@ def harmonise(
             help="Weight each constraint by the square root of its sample count.",
         ),
     ] = True,
+    model: Annotated[
+        HarmonisationModel,
+        typer.Option(
+            "--model",
+            help=(
+                "'gain' fixes a scale difference between blocks. 'gain-offset' also fixes a "
+                "black-level difference, which no gain can reach."
+            ),
+        ),
+    ] = HarmonisationModel.GAIN,
 ) -> None:
     """Solve one radiometric gain per block per band from measured overlaps.
 
@@ -343,26 +582,34 @@ def harmonise(
     """
     settings = get_settings()
     workspace = Workspace(settings.workspace_root)
-    directory = workspace.project_dir(project_id)
+    measurements = workspace.reports_dir(project_id, "radiometry")
+    solutions = workspace.reports_dir(project_id, "harmonisation")
 
-    chosen = report_path or latest_radiometry_report(directory)
+    chosen = report_path or latest_radiometry_report(measurements)
     if chosen is None or not chosen.is_file():
         error_console().print(
-            f"no radiometry report for {project_id} in {directory}; "
+            f"no radiometry report for {project_id} in {measurements}; "
             "run 'drone-photo radiometry' first"
         )
         raise typer.Exit(EXIT_FAIL)
 
     report = read_radiometry_report(chosen)
     try:
-        solution = solve_gains(report, weight_by_samples=weight_by_samples)
+        solution = (
+            solve_gain_offset(report, weight_by_samples=weight_by_samples)
+            if model is HarmonisationModel.GAIN_OFFSET
+            else solve_gains(report, weight_by_samples=weight_by_samples)
+        )
     except HarmonisationError as error:
         error_console().print(f"[bold red]FAILED[/bold red] {error}")
         raise typer.Exit(EXIT_FAIL) from error
 
     stamp = solution.generated_at.strftime("%Y%m%dT%H%M%SZ")
-    solution_path = write_harmonisation(directory / f"harmonisation_{stamp}.json", solution)
-    csv_path = write_harmonisation_gains_csv(directory / "harmonisation_gains.csv", solution)
+    # The model is in the filename because a gain solution and a gain+offset solution are not
+    # interchangeable and are indistinguishable at a glance once written.
+    name = f"harmonisation_{stamp}_{solution.model}_{solution.space.value}"
+    solution_path = write_harmonisation(solutions / f"{name}.json", solution)
+    csv_path = write_harmonisation_gains_csv(solutions / f"{name}.csv", solution)
     _render_harmonisation(solution, solution_path, csv_path)
 
 
@@ -477,18 +724,45 @@ def _render_harmonisation(
             f"{solution.block_count} blocks"
         )
     )
+    offset_model = solution.model == "gain_offset"
     table.add_column("band")
-    for column in ("median before", "median after", "90th before", "90th after", "gain range"):
+    columns = ["before", "gain only"]
+    if offset_model:
+        columns.append("gain+offset")
+    columns += ["90th before", "90th after", "gain range"]
+    if offset_model:
+        columns.append("offset range")
+    for column in columns:
         table.add_column(column, justify="right")
+
     for residual in solution.residuals:
-        table.add_row(
+        after = (
+            residual.median_after_offset_pct
+            if offset_model and residual.median_after_offset_pct is not None
+            else residual.median_after_pct
+        )
+        p90_after = (
+            residual.p90_after_offset_pct
+            if offset_model and residual.p90_after_offset_pct is not None
+            else residual.p90_after_pct
+        )
+        row = [
             residual.band,
             f"{residual.median_before_pct:.1f} %",
-            f"[green]{residual.median_after_pct:.1f} %[/green]",
+            f"{residual.median_after_pct:.1f} %",
+        ]
+        if offset_model:
+            row.append(f"[green]{after:.1f} %[/green]")
+        row += [
             f"{residual.p90_before_pct:.1f} %",
-            f"{residual.p90_after_pct:.1f} %",
+            f"{p90_after:.1f} %",
             f"{residual.gain_min:.2f} - {residual.gain_max:.2f}",
-        )
+        ]
+        if offset_model:
+            lo = residual.offset_min if residual.offset_min is not None else 0.0
+            hi = residual.offset_max if residual.offset_max is not None else 0.0
+            row.append(f"{lo:+.1f} to {hi:+.1f} DN")
+        table.add_row(*row)
     console().print(table)
 
     if not solution.is_single_component:

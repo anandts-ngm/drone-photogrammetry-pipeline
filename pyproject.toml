@@ -72,6 +72,10 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["ARG"]
+# NodeODM's API uses camelCase field names. The schema mirrors them exactly so it can be
+# compared against the upstream documentation without translating, and so a rename upstream
+# shows up as a mismatch rather than being silently absorbed.
+"src/drone_photogrammetry_pipeline/nodeodm/schemas.py" = ["N815"]
 
 [tool.mypy]
 python_version = "3.12"

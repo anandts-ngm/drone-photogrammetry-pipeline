@@ -8,11 +8,11 @@
 # No processing.odm section exists because no ODM run happens on this route.
 
 profile_id: external_terra
-# Version 2 added the radiometry.history field. The 9 Sant masters produced on 2026-08-18
-# record profile_version 1 and its hash, which remains an accurate record of what was
-# actually applied to them; only the human-readable history text is absent from those
-# manifests. Re-running Sant would add it, and would change nothing about the pixels.
-profile_version: 2
+# v2 added radiometry.history. v3 rewrote it to stop referencing a per-delivery claim: this
+# profile is shared by every Terra delivery, so it must not assert what was verified for only
+# one of them. The 9 Sant masters produced on 2026-08-18 record profile_version 1 and its
+# hash, which remains an accurate record of what was applied to them.
+profile_version: 3
 
 sensor: null
 lens: null
@@ -31,8 +31,9 @@ radiometry:
   history: >
     DJI Terra export with no known post-processing. Terra's own settings were outside our
     control, so the absolute radiometry is uncontrolled, but nothing is known to have been
-    applied to the pixels afterwards. If a downstream correction WAS applied, use
-    external_terra_corrected instead: that is a different claim about the product.
+    applied to the pixels afterwards. Evidence for that claim is per-delivery and belongs in
+    docs/decisions-and-verification.md, not here: this profile is shared across deliveries and
+    must not assert what was verified for only one of them.
 
 outputs:
   orthophoto: true

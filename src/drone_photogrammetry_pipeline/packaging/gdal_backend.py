@@ -23,6 +23,7 @@ from rasterio.enums import ColorInterp, MaskFlags
 from rasterio.windows import Window
 
 from ..models.enums import AlphaProvenance
+from .correction import BlockCorrection, apply_correction
 
 # The master contract in GDAL terms. BIGTIFF is YES rather than ODM's IF_SAFER because the
 # contract is unconditional: a 3.9 GB block and a 4.1 GB block must not be different
@@ -137,6 +138,11 @@ class PackagingPlan:
     allow_alpha_from_nodata: bool = False
     verify_pixels: bool = False
 
+    # A solved radiometric correction to apply while writing. Absent means the master carries
+    # the delivered pixels unchanged, which is the default: correcting is a deliberate act
+    # that changes what the product is, not a packaging detail.
+    correction: BlockCorrection | None = None
+
     # A vertical reference that the source file does not carry can only come from a document,
     # never from the pixels, so declaring one is always explicit. Deliveries whose vertical
     # CRS lives in an accompanying metadata sheet rather than in the file header are the
@@ -244,6 +250,15 @@ class RasterioGdalBackend:
             return self._package(source, destination, plan)
 
     def _package(self, source: Path, destination: Path, plan: PackagingPlan) -> PackagingOutcome:
+        # Verification asserts the RGB bands are bit-identical before and after packaging; a
+        # correction changes them on purpose. Silently skipping the check would leave a run
+        # claiming verification it never performed, so the contradiction is refused instead.
+        if plan.correction is not None and plan.verify_pixels:
+            raise PackagingError(
+                "pixel verification and radiometric correction cannot both be requested: "
+                "verification requires the pixels to be unchanged and correction changes them"
+            )
+
         operations: list[tuple[str, str]] = []
         with rasterio.open(source) as src:
             if src.crs is None:
@@ -272,6 +287,16 @@ class RasterioGdalBackend:
                     ("nodata", f"dropped {dropped_nodata}; alpha is the validity mask")
                 )
 
+            if plan.correction is not None:
+                gains = ", ".join(f"{g:.4f}" for g in plan.correction.gains)
+                operations.append(
+                    (
+                        "radiometric_correction",
+                        f"gains ({gains}) applied in {plan.correction.space.value} space "
+                        f"from {plan.correction.source_solution}",
+                    )
+                )
+
             output_crs = self._resolve_crs(src, plan, operations)
             alpha_max = 255 if dtype == "uint8" else 65535
             profile: dict[str, Any] = {
@@ -297,11 +322,10 @@ class RasterioGdalBackend:
                     ColorInterp.alpha,
                 )
                 for window in _windows(int(src.width), int(src.height), 512, 512):
-                    dst.write(
-                        src.read(indexes=list(rgb_bands), window=window),
-                        indexes=[1, 2, 3],
-                        window=window,
-                    )
+                    rgb = src.read(indexes=list(rgb_bands), window=window)
+                    if plan.correction is not None:
+                        rgb = apply_correction(rgb, plan.correction, max_value=alpha_max)
+                    dst.write(rgb, indexes=[1, 2, 3], window=window)
                     dst.write(
                         self._alpha_for(src, alpha_plan, window, dtype, alpha_max),
                         4,

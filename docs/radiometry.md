@@ -196,6 +196,56 @@ Blocks with few overlaps have correspondingly weaker constraints — B1 has 3, B
 have 4 — and their coefficients should be treated as less certain than a block tied in by
 eight.
 
+## 6a2. Two metrics, and why only one of them is honest
+
+The first measurement compared blocks **at the median only**. That understates the problem
+wherever the disagreement varies across the brightness range, which is exactly where a dark,
+partly clipped band is worst. Matched quantiles are now recorded per pair (5, 10, 25, 50, 75,
+90, 95) and the residual is evaluated at all of them.
+
+The difference is not cosmetic. Sant's blue after gain-only harmonisation:
+
+| metric | result |
+|---|---|
+| median only | 3.6 % |
+| across the distribution | **8.8 %** |
+
+Both are correct arithmetic on the same data; only the second answers the question anyone
+actually cares about. **Quote the quantile figure.** Any median-only number in an earlier
+version of this document flatters the result.
+
+Quantiles are stored in the report rather than summarised into a slope, so a reader can
+re-derive the fit and disagree with it. A slope on its own cannot be argued with.
+
+## 6a3. Does an offset help? No — measured, 2026-08-18
+
+A block pair can differ by a **scale factor** (a gain fixes it) or by a **black level** (no
+gain can reach it). Sant's blue was the candidate for the second: dark, with 35–46 % of
+pixels below 32 DN and ~0.8 % clipped at zero.
+
+Both models, judged by the same quantile metric:
+
+| band | before | gain only | gain + offset |
+|---|---|---|---|
+| red | 8.2 % | **3.7 %** | 4.2 % *(worse)* |
+| green | 5.7 % | 3.6 % | 3.4 % |
+| blue | 17.7 % | **8.8 %** | 7.5 % |
+
+Offsets of −19.6 to +14.7 DN buy 1.3 pp on blue, nothing on green, and make red worse. Large
+parameters purchasing almost no improvement is the signature of a model absorbing noise
+rather than structure.
+
+**Conclusion: Sant's blue residual is not a black-level problem, and gain-only remains the
+right model.** The likeliest explanation is that blue carries too little signal to recover —
+not that it is mis-referenced. Until something better than a linear correction exists, Sant's
+blue should be excluded from ratio products rather than quietly used.
+
+A note on the comparison itself: the gain-only column must come from a **through-origin**
+fit. Taking the slope from a fit that also estimated an intercept and then discarding the
+intercept is not a gain-only model — it reads as worse than applying nothing, because the two
+terms were fitted together. An earlier version of this comparison made that mistake and would
+have overstated the offset's value.
+
 ## 6b. From measurement to correction
 
 The overlap graph for Buduunkhad is **a single connected component**: 435 pairs sharing at

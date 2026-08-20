@@ -22,6 +22,12 @@ _error_console = Console(stderr=True)
 
 # Attributes present on every LogRecord. Anything else was passed by a caller via
 # `extra=` and belongs in the structured output.
+#
+# These names are also FORBIDDEN as `extra` keys: the standard library raises if `extra`
+# would overwrite one, and because that only happens once logging is actually configured, the
+# failure hides during isolated tests and appears in production. `name`, `module`, `filename`
+# and `args` are the easy ones to reach for by accident — use `task_name`, `block_name` and
+# so on instead.
 _STANDARD_RECORD_FIELDS = frozenset(logging.LogRecord("", 0, "", 0, "", None, None).__dict__)
 
 

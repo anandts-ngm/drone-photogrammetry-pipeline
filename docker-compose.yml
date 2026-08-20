@@ -1,0 +1,39 @@
+# Local NodeODM for development and benchmark processing.
+#
+# Pinned by DIGEST, not by tag. The reproducibility requirement forbids floating tags, and
+# the newest concrete tag (3.5.6, July 2025) is well behind the current engine. A digest
+# gives both: nothing moves under us, and we are not a year behind.
+#
+# The digest below is `latest` as resolved on 2026-08-18. Refreshing it is a deliberate act:
+#
+#   docker pull opendronemap/nodeodm:latest
+#   docker inspect --format='{{index .RepoDigests 0}}' opendronemap/nodeodm:latest
+#
+# then update the digest here, note the date, and re-run the benchmark. Never change it as a
+# side effect of something else: the engine version is part of what a product's manifest
+# claims, and every run records `engineVersion` from GET /info as the ground truth for what
+# actually processed the data.
+
+services:
+  nodeodm:
+    image: opendronemap/nodeodm@sha256:8845ee48c5ef8dc8a1cecbca84d97b62e2fdf582d81150e240171573b599880b
+    container_name: dpp-nodeodm
+    restart: unless-stopped
+    ports:
+      - "${DPP_NODEODM_PORT:-3000}:3000"
+    volumes:
+      # NodeODM's own working area. Kept in a named volume rather than a bind mount so a
+      # container restart does not lose in-flight tasks, and so nothing it writes can land
+      # anywhere near a source tree.
+      - nodeodm-data:/var/www/data
+    # Reconstruction is memory-hungry; a P1 block will use far more than Docker Desktop's
+    # default allowance. Raise the Docker VM limits if tasks fail with out-of-memory.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/info"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  nodeodm-data:

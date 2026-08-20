@@ -159,7 +159,24 @@ distinct types. Height-type recording with explicit failure when undeterminable.
 *Done when:* `drone-photo validate ./example_p1_block` classifies every expectation
 correctly, including the "missing but acceptable" and "missing and fatal" cases.
 
-### Phase 4 — NodeODM *(items 10, 11, 12, 13, 14, 20)*
+### Phase 4 — NodeODM — **client and compose DONE; adapter and CLI outstanding**
+*(items 10, 11, 12, 13, 14, 20)*
+
+Built: `nodeodm/client.py` and `nodeodm/schemas.py` — the only modules that speak HTTP to
+NodeODM — plus `docker-compose.yml` pinned by digest. 21 tests, mocked at the httpx transport
+layer so both the requests built and the responses parsed are covered, with no container.
+
+Three things the client does deliberately:
+
+- **Chunked upload always.** A P1 block is hundreds of 25 MB images; a single multipart POST
+  of several gigabytes restarts from zero on any failure.
+- **Retries only where safe.** Transport errors and 5xx are retried with backoff; a 4xx is
+  the server saying the request was wrong, and repeating it asks the same wrong question.
+- **Options validated against the running engine** via `/options`, never against a table kept
+  in this repository, which would eventually disagree with the engine actually running.
+
+Outstanding: `processing/odm.py` (the adapter that turns a validated block into a task and
+its result into a `SourceOrtho`), and the `process` / `status` / `fetch` CLI commands.
 `nodeodm/client.py` (the only module that speaks HTTP to NodeODM), `docker-compose.yml`,
 `processing/odm.py`, CLI `process`, `status`, `fetch`. Chunked upload, task polling,
 console-log capture, `all.zip` retrieval and selective extraction, cancel, bounded retry.
