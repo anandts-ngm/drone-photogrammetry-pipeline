@@ -328,6 +328,48 @@ Settling it needs a check point, or the same block processed both ways and compa
 `p1-geo --apply-lever-arm` exists to run that experiment and is off by default, and this is the
 one case where writing a `geo.txt` is the point rather than a cost.
 
+### 2.17 Prompts live in setup only — **DECIDED**
+
+Preparing this for other people raised the question of whether the commands should ask for
+what they need. Two commands do, and the processing commands never will.
+
+`init` and `new-project` run before anything is being processed, so there is nothing in flight
+for a prompt to interrupt, and what they produce is a file rather than an answer that scrolls
+away. Both take flags plus `--yes` so a script is never blocked on a human being present.
+
+`process-project` asks nothing, and the reason is not taste:
+
+* A run is two hours unattended. A prompt can surface at minute 50 with nobody watching, and
+  it would break any future scheduling or unattended rerun.
+* `declare_crs` and `height_type` are the 48 m fields. Typed at a prompt, that decision leaves
+  no record of *why*; in `projects/*.yaml` it sits next to the document it came from. The one
+  place a prompt earns its keep is `new-project`, which asks whether a document states a
+  vertical datum rather than letting the answer default silently to "no" -- and then writes the
+  document's name into `notes` so the next reader can check it.
+* `--dry-run` already answers "tell me what you are about to do" without asking anything.
+
+### 2.18 The overview's resolution is chosen, not configured — **DECIDED**
+
+`overview_gsd` was the last number a new area needed someone to pick, and no fixed value can
+serve every area. Both existing overviews were built at 0.5 m by hand. Measured against the
+real extents, that is 19531 x 12869 px and 404 MB for Buduunkhad, while the same 0.5 m over a
+350 ha P1 block would be under 4000 px: too much browse image in one case and too little in the
+other.
+
+It is now derived from the survey's extent, capped at a 10,000 pixel long edge, snapped to a
+1-2-5 ladder, and never finer than the finest master present (past that it is upsampling, which
+adds bytes and no detail). Measured:
+
+| survey | extent | chosen | long edge |
+|---|---:|---:|---:|
+| Buduunkhad | 9,766 m | 1 m | 9,766 px |
+| Sant | 2,667 m | 0.5 m | 5,334 px |
+| a 350 ha P1 block | 1,870 m | 0.2 m | 9,350 px |
+
+A cap rather than a target, because the failure that matters is a browse image too large to
+browse. Sant lands on the 0.5 m it was given; Buduunkhad becomes 1 m, which is the intended
+change. Only a derived viewing product is affected, so nothing measured depends on it.
+
 ### 2.6 Deviations from the proposed repository tree
 
 Six small additions, each with a reason, listed in `milestone-1-plan.md` §2. Flagged here

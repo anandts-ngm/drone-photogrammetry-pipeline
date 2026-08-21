@@ -45,17 +45,20 @@ Docker, no GPU.
 ```bash
 git clone <this repo> && cd drone-photogrammetry-pipeline
 uv sync --all-groups
-cp .env.example .env
+uv run drone-photo init
 ```
 
-**2. Set two paths in `.env`.** Everything else has a working default.
+**2. `init` asks two questions** — where the deliveries are, and where the products should go —
+then checks both paths are usable, creates them if you want, writes `.env`, and reports which
+projects already have blocks to process. It is the only command that asks anything.
 
 ```ini
-DPP_INPUTS_ROOT=D:/drone_inputs             # where the deliveries are. Never written to.
+DPP_INPUTS_ROOT=D:/drone_inputs              # where the deliveries are. Never written to.
 DPP_WORKSPACE_ROOT=D:/photogrammetry_outputs # where the products go. Must be outside the repo.
 ```
 
-Put them on a volume with room: a 79-block survey reads 92 GB and writes about 75 GB.
+Put them on a volume with room: a 79-block survey reads 92 GB and writes about 75 GB. To skip
+the questions, `init --inputs <dir> --workspace <dir> --yes`, or copy `.env.example` by hand.
 
 **3. Put the orthophotos where the tool looks for them** — one directory per project, one
 directory per block inside it, each holding its `dom.tif` exactly as Terra exported it:
@@ -104,7 +107,7 @@ only what changed. Ctrl-C, reboot, rerun.
 | | |
 |---|---|
 | `<workspace>/<project>/<block>/runs/<run>/master/` | the corrected orthophoto, its manifest, its QA result |
-| `<workspace>/<project>/derived/<project>_overview.jpg` | the whole survey in one image — open this first |
+| `<workspace>/<project>/derived/<project>_overview.jpg` | the whole survey in one image, at a resolution chosen from its extent — open this first |
 | `<workspace>/<project>/derived/<project>_contact_sheet.jpg` | every block on one page, labelled |
 | `<workspace>/<project>/derived/<project>_mosaic.vrt` | open in QGIS for full-resolution work |
 | `<workspace>/<project>/reports/` | what was measured, what was solved, what each run did |
@@ -146,6 +149,19 @@ The sources are looked for in `<DPP_INPUTS_ROOT>/<project_id lower-cased>`, then
 of them exists the error names all three, so there is nothing to guess about where a delivery
 should have been.
 
+**For a new exploration area, generate the file rather than copying one:**
+
+```bash
+uv run drone-photo new-project "Artsat" --source-root D:/drone_inputs/artsat
+```
+
+It counts the blocks, reads their CRS, refuses a folder holding two cameras, and then asks the
+one question that cannot be answered from the imagery: *does a delivery document state a
+vertical datum?* If yes, it composes `EPSG:<horizontal>+<vertical>` from the files and your
+answer, requires the height type, and records the document's name in `notes`. If no, it
+declares nothing and says so. Nothing else about a new area needs a decision — the overview's
+resolution is chosen from the survey's extent.
+
 `declare_crs` is documented for Buduunkhad in `METADATA_Buduunkhad_XV-023222.txt`, which also
 records that the geoid was already applied in the field: reapplying it costs about 48 m. Sant
 came with no such document, so `projects/sant.yaml` declares nothing and its masters are not
@@ -164,6 +180,8 @@ repackage the whole delivery: on Buduunkhad that is an extra 96 minutes.
 
 | Command | Purpose |
 |---|---|
+| `init` | Check and write the two paths this checkout needs |
+| `new-project` | Write a project file for a new exploration area |
 | `process-project` | A whole delivery from a project file: measure, solve, package, derive |
 | `validate` | Inventory a block and report what is present or missing |
 | `ingest-ortho` | Package one external orthophoto, with a manifest |

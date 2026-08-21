@@ -19,7 +19,9 @@ declare_crs: null
 height_type: UNKNOWN
 sensor: null
 
-overview_gsd: 1.0
+# Unset: chosen from the survey's extent. Sant is 2,667 m across, so this comes out at 0.5 m
+# rather than the 1 m the larger survey gets.
+overview_gsd: null
 preview_longest_side: 2048
 destripe_previews: true
 

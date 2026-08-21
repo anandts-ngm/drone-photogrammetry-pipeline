@@ -25,7 +25,9 @@ height_type: NORMAL
 # sensor identification, so stamping one across all 79 blocks would be a guess.
 sensor: null
 
-overview_gsd: 1.0
+# Unset: chosen from the survey's extent, capped at a 10,000 px long edge. This survey is
+# 9,766 m across, so it comes out at 1 m: 9766 x 6435 px, about 100 MB.
+overview_gsd: null
 preview_longest_side: 2048
 destripe_previews: true
 

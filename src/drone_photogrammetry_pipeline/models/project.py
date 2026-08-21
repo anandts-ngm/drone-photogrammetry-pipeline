@@ -65,8 +65,10 @@ class ProjectConfig(BaseModel):
     allow_alpha_from_nodata: bool = False
     verify_pixels: bool = False
 
-    # Ground sample distance of the browsable overview, in metres.
-    overview_gsd: float = 0.5
+    # Ground sample distance of the browsable overview, in metres. Left unset it is chosen from
+    # the survey's extent, which is what a new area wants: one fixed number cannot serve both a
+    # 6,285 ha survey and a 350 ha one.
+    overview_gsd: float | None = None
     preview_longest_side: int = 2048
     destripe_previews: bool = True
 
@@ -84,8 +86,8 @@ class ProjectConfig(BaseModel):
                 "but height_type is UNKNOWN. State which surface the heights are above, or "
                 "declare only the horizontal CRS"
             )
-        if self.overview_gsd <= 0:
-            raise ValueError("overview_gsd must be positive")
+        if self.overview_gsd is not None and self.overview_gsd <= 0:
+            raise ValueError("overview_gsd must be positive, or absent to choose it from extent")
         return self
 
 

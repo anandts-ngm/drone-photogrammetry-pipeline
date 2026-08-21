@@ -31,7 +31,13 @@ from rasterio.warp import reproject
 from .destripe import DEFAULT_TREND_WINDOW, destripe
 from .preview import PreviewError, composite_on_white
 
-DEFAULT_GSD = 1.0
+# The most an automatically chosen resolution will put on the overview's long edge. Large
+# enough that a screen-filling view of a whole survey still has detail to zoom into, small
+# enough to open at once: 10,000 px is 63 megapixels on a survey shaped like Buduunkhad, about
+# 100 MB. A cap rather than a target, because the failure worth avoiding is a browse image too
+# big to browse.
+MAX_LONG_EDGE_PIXELS = 10_000
+
 _MASTER_CREATION = {
     "driver": "GTiff",
     "compress": "DEFLATE",
@@ -55,6 +61,36 @@ class Overview:
     bytes_written: int
 
 
+def choose_gsd(
+    longest_extent_m: float,
+    *,
+    finest_native: float,
+    max_pixels: int = MAX_LONG_EDGE_PIXELS,
+) -> float:
+    """A browsable resolution for a survey of this size.
+
+    Exists so that a new area needs no number chosen for it, and no fixed value can do that
+    job: measured on the real deliveries, 0.5 m gives Buduunkhad 19531 x 12869 px and 404 MB,
+    while the same 0.5 m over a 350 ha P1 block would give under 4000 px. Both are the wrong
+    product for opposite reasons.
+
+    The coarsest of the candidates that still fits, rather than the closest: overshooting the
+    cap is the failure that matters, since a browse image too large to open is not a browse
+    image. Snapped to a 1-2-5 ladder because these values end up in filenames, reports and
+    conversations, where "0.977 m" invites a question about where it came from. Never finer
+    than the finest master present: past that it is upsampling, which adds bytes and no detail.
+    """
+    if longest_extent_m <= 0:
+        raise PreviewError(f"a survey {longest_extent_m} m across has no extent to render")
+
+    coarsest_needed = longest_extent_m / max(1, max_pixels)
+    ladder = sorted(
+        multiple * 10.0**exponent for exponent in range(-4, 6) for multiple in (1.0, 2.0, 5.0)
+    )
+    fitting = next((step for step in ladder if step >= coarsest_needed), ladder[-1])
+    return max(fitting, finest_native)
+
+
 def _read_for_overview(
     master: Path, gsd: float
 ) -> tuple[NDArray[np.uint8], NDArray[np.uint8], object]:
@@ -75,7 +111,7 @@ def build_overview(
     masters: list[Path],
     destination: Path,
     *,
-    gsd: float = DEFAULT_GSD,
+    gsd: float | None = None,
     apply_destripe: bool = True,
     window: int = DEFAULT_TREND_WINDOW,
     progress: object = None,
@@ -85,11 +121,13 @@ def build_overview(
         raise PreviewError("no masters given; an overview of nothing is not a product")
 
     bounds = []
+    native: list[float] = []
     seen: dict[str, Path] = {}
     crs = None
     for master in masters:
         with rasterio.open(master) as ds:
             bounds.append(ds.bounds)
+            native.append(abs(float(ds.transform.a)))
             crs = crs or ds.crs
             seen.setdefault(str(ds.crs), master)
 
@@ -109,6 +147,9 @@ def build_overview(
     right = max(b.right for b in bounds)
     bottom = min(b.bottom for b in bounds)
     top = max(b.top for b in bounds)
+
+    if gsd is None:
+        gsd = choose_gsd(max(right - left, top - bottom), finest_native=min(native))
 
     width = max(1, round((right - left) / gsd))
     height = max(1, round((top - bottom) / gsd))

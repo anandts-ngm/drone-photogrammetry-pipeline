@@ -24,7 +24,7 @@ from .derive.mosaic import (
     build_mosaic,
     overview_factors,
 )
-from .derive.overview import DEFAULT_GSD, build_overview, write_overview_jpeg
+from .derive.overview import build_overview, write_overview_jpeg
 from .derive.preview import (
     DEFAULT_LONGEST_SIDE,
     DEFAULT_QUALITY,
@@ -90,7 +90,7 @@ from .reporting.manifest import (
     write_project_summary,
     write_radiometry_report,
 )
-from .workspace import Workspace, make_run_id
+from .workspace import Workspace, WorkspaceLocationError, make_run_id
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -189,6 +189,372 @@ _SOURCE_TYPES = {ExternalSource.TERRA: SourceType.DJI_TERRA}
 def version() -> None:
     """Print the pipeline version."""
     console().print(__version__)
+
+
+@app.command()
+def init(
+    inputs_root: Annotated[
+        Path | None,
+        typer.Option("--inputs", help="Directory holding the deliveries to process."),
+    ] = None,
+    workspace_root: Annotated[
+        Path | None,
+        typer.Option("--workspace", help="Directory to write every product into."),
+    ] = None,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="Take the defaults and ask nothing. For scripts."),
+    ] = False,
+) -> None:
+    """Write the .env this checkout needs, after checking the paths are usable.
+
+    The only interactive command here, and deliberately the only one: it runs before anything
+    is processed, so there is nothing in flight to interrupt. The processing commands stay
+    silent and scriptable, and the decisions that matter stay in files that can be reviewed.
+    """
+    settings = get_settings()
+    env_path = Path(".env")
+    existing = _read_env(env_path)
+
+    inputs = inputs_root or _ask_path(
+        "Where are the deliveries to process?",
+        default=Path(existing.get("DPP_INPUTS_ROOT", str(settings.inputs_root))),
+        yes=yes,
+    )
+    workspace = workspace_root or _ask_path(
+        "Where should the products go?",
+        default=Path(existing.get("DPP_WORKSPACE_ROOT", str(settings.workspace_root))),
+        yes=yes,
+    )
+
+    console().print("")
+    problems = 0
+    for label, path, must_be_outside_repo in (
+        ("inputs", inputs, False),
+        ("workspace", workspace, True),
+    ):
+        problems += _report_path(label, path, must_be_outside_repo=must_be_outside_repo, yes=yes)
+    if problems:
+        error_console().print(f"\n[bold red]{problems} problem(s)[/bold red]; nothing was written")
+        raise typer.Exit(EXIT_FAIL)
+
+    # Space is checked against the largest delivery present rather than in the abstract, because
+    # "make sure you have enough room" is not a number anyone can act on.
+    free = _free_bytes(workspace)
+    console().print(f"free:      {free / _GIB:.0f} GiB on the workspace volume")
+
+    written = _write_env(env_path, inputs=inputs, workspace=workspace)
+    console().print(f"wrote:     {written}")
+
+    console().print("\n[bold]projects[/bold]")
+    for config_path in sorted(Path("projects").glob("*.yaml")):
+        _report_project(config_path, inputs_root=inputs)
+    console().print("\nRun one with:  drone-photo process-project projects/<name>.yaml --dry-run")
+
+
+def _read_env(path: Path) -> dict[str, str]:
+    """The settings already in a .env, so an existing one is amended rather than replaced."""
+    found: dict[str, str] = {}
+    if not path.is_file():
+        return found
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        found[key.strip()] = value.strip()
+    return found
+
+
+def _ask_path(question: str, *, default: Path, yes: bool) -> Path:
+    if yes:
+        return default
+    answer = typer.prompt(question, default=str(default))
+    return Path(str(answer).strip().strip('"'))
+
+
+def _report_path(label: str, path: Path, *, must_be_outside_repo: bool, yes: bool) -> int:
+    """Describe one configured directory, creating it on request. Returns problems found."""
+    resolved = path.expanduser().resolve()
+    console().print(f"{label + ':':<11}{resolved}")
+
+    if must_be_outside_repo:
+        try:
+            Workspace(resolved)
+        except WorkspaceLocationError as error:
+            error_console().print(f"  [bold red]no[/bold red]: {error}")
+            return 1
+
+    if resolved.is_dir():
+        return 0
+    if resolved.exists():
+        error_console().print("  [bold red]no[/bold red]: that path exists and is a file")
+        return 1
+    if yes or typer.confirm(f"  {resolved} does not exist. Create it?", default=True):
+        resolved.mkdir(parents=True, exist_ok=True)
+        console().print("  created")
+        return 0
+    error_console().print("  [yellow]left missing[/yellow]")
+    return 1
+
+
+def _write_env(path: Path, *, inputs: Path, workspace: Path) -> Path:
+    """Set the two paths in `.env`, keeping every other line as it was.
+
+    Rewritten in place rather than regenerated from the template, so a node URL or log level
+    someone set for a reason survives running this again.
+    """
+    updates = {
+        "DPP_INPUTS_ROOT": inputs.expanduser().resolve().as_posix(),
+        "DPP_WORKSPACE_ROOT": workspace.expanduser().resolve().as_posix(),
+    }
+    template = Path(".env.example")
+    lines = (
+        path.read_text(encoding="utf-8").splitlines()
+        if path.is_file()
+        else (template.read_text(encoding="utf-8").splitlines() if template.is_file() else [])
+    )
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in lines:
+        key = line.split("=", 1)[0].strip()
+        if key in updates:
+            out.append(f"{key}={updates[key]}")
+            seen.add(key)
+        else:
+            out.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            out.append(f"{key}={value}")
+
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return path
+
+
+def _report_project(config_path: Path, *, inputs_root: Path) -> None:
+    """One line per project file: whether its blocks can be found, and how many there are."""
+    try:
+        project = load_project(config_path)
+    except ProjectConfigError as error:
+        error_console().print(f"  [red]{config_path.name}[/red]: {error}")
+        return
+
+    try:
+        root = resolve_source_root(
+            project,
+            inputs_root=inputs_root,
+            slug=Workspace.project_slug(project.project_id),
+        )
+    except ProjectConfigError:
+        console().print(
+            f"  [yellow]{project.project_id}[/yellow]: no blocks yet. Put them in "
+            f"{(inputs_root / Workspace.project_slug(project.project_id)).as_posix()}"
+        )
+        return
+
+    blocks = discover_blocks(root, project.asset)
+    if not blocks:
+        console().print(
+            f"  [yellow]{project.project_id}[/yellow]: {root} holds no directory containing "
+            f"{project.asset}"
+        )
+        return
+    size = sum(path.stat().st_size for _, path in blocks) / _GIB
+    console().print(
+        f"  [green]{project.project_id}[/green]: {len(blocks)} "
+        f"block{'' if len(blocks) == 1 else 's'}, {size:.1f} GiB in {root}"
+    )
+
+
+@app.command("new-project")
+def new_project(
+    project_id: Annotated[
+        str, typer.Argument(help="Name of the exploration area, as it should be reported.")
+    ],
+    source_root: Annotated[
+        Path | None,
+        typer.Option("--source-root", help="Where the block directories are."),
+    ] = None,
+    asset: Annotated[
+        str, typer.Option("--asset", help="Filename of the orthophoto in each block directory.")
+    ] = "dom.tif",
+    declare_crs: Annotated[
+        str | None,
+        typer.Option(
+            "--declare-crs",
+            help="Compound CRS to declare, e.g. EPSG:32647+5705. Only from a document.",
+        ),
+    ] = None,
+    height_type: Annotated[
+        HeightType,
+        typer.Option("--height-type", help="Which surface the declared heights are above."),
+    ] = HeightType.UNKNOWN,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="Ask nothing; declare only what the options say."),
+    ] = False,
+    force: Annotated[bool, typer.Option("--force", help="Overwrite an existing file.")] = False,
+) -> None:
+    """Write a project file for a new exploration area.
+
+    Interactive because of one question. A delivery's vertical datum cannot be read from the
+    imagery, and getting it wrong moves every elevation by tens of metres, so this asks whether
+    a document states one instead of letting the answer default quietly to "no".
+    """
+    settings = get_settings()
+    slug = Workspace.project_slug(project_id)
+    destination = Path("projects") / f"{slug}.yaml"
+    if destination.exists() and not force:
+        error_console().print(
+            f"{destination} already exists. Edit it, or pass --force to replace it"
+        )
+        raise typer.Exit(EXIT_FAIL)
+
+    root = (source_root or (settings.inputs_root / slug)).expanduser().resolve()
+    if not root.is_dir():
+        error_console().print(
+            f"no directory at {root}. Put the delivery's block directories there first, or "
+            "pass --source-root"
+        )
+        raise typer.Exit(EXIT_FAIL)
+
+    blocks = discover_blocks(root, asset)
+    if not blocks:
+        error_console().print(
+            f"{root} holds no directory containing {asset}. Each block belongs in its own "
+            f"directory with the orthophoto inside it; pass --asset if it is not called {asset}"
+        )
+        raise typer.Exit(EXIT_FAIL)
+
+    sources = describe_sources(blocks)
+    _check_one_grid(sources)
+    horizontal = sources[0].crs or "unknown"
+    size = sum(path.stat().st_size for _, path in blocks) / _GIB
+    console().print(
+        f"[bold]{project_id}[/bold]: {len(blocks)} block{'' if len(blocks) == 1 else 's'}, "
+        f"{size:.1f} GiB, {horizontal}"
+    )
+
+    # The two dangerous fields. Asked rather than defaulted, and only ever from a document:
+    # the delivered files carry no vertical CRS at all, so a guess here is indistinguishable
+    # from a fact for everyone downstream.
+    notes = ""
+    if declare_crs is None and not yes:
+        console().print(
+            "\nThe delivered files declare a horizontal CRS and no vertical one. Declaring a "
+            "vertical reference is only correct if a delivery document states it: for "
+            "Buduunkhad that document also recorded that the geoid had already been applied in "
+            "the field, and reapplying it would have moved every height by about 48 m."
+        )
+        if typer.confirm("Does a delivery document state a vertical datum?", default=False):
+            code = typer.prompt("  Vertical EPSG code (Baltic 1977 is 5705)")
+            declare_crs = f"{horizontal}+{str(code).strip()}"
+            height_type = HeightType(
+                typer.prompt(
+                    "  Which surface are those heights above? (NORMAL / ORTHOMETRIC / ELLIPSOIDAL)",
+                    default=HeightType.NORMAL.value,
+                )
+                .strip()
+                .upper()
+            )
+            document = typer.prompt("  Which document says so?", default="")
+            if document.strip():
+                notes = f"Vertical reference from {document.strip()}."
+
+    if declare_crs and "+" in declare_crs and height_type is HeightType.UNKNOWN:
+        error_console().print(
+            f"{declare_crs} adds a vertical component, so --height-type must say which surface "
+            "those heights are above"
+        )
+        raise typer.Exit(EXIT_FAIL)
+
+    document = _render_project_file(
+        project_id=project_id,
+        source_root=None if source_root is None else root,
+        asset=asset,
+        declare_crs=declare_crs,
+        height_type=height_type,
+        notes=notes,
+        blocks=len(blocks),
+        horizontal=horizontal,
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(document, encoding="utf-8")
+
+    console().print(f"wrote:  {destination}")
+    if declare_crs:
+        console().print(f"crs:    {declare_crs}  heights {height_type.value}")
+    else:
+        console().print(
+            "crs:    horizontal only. These products will not be suitable for absolute-Z work "
+            "until a document states the vertical datum"
+        )
+    console().print(f"\nNext:   drone-photo process-project {destination.as_posix()} --dry-run")
+
+
+def _render_project_file(
+    *,
+    project_id: str,
+    source_root: Path | None,
+    asset: str,
+    declare_crs: str | None,
+    height_type: HeightType,
+    notes: str,
+    blocks: int,
+    horizontal: str,
+) -> str:
+    """The YAML, with the reasoning kept next to the values it explains.
+
+    Generated as text rather than dumped from a dict so the comments survive. A project file
+    with the values but not the reasons is the thing that gets edited wrongly a year later.
+    """
+    lines = [
+        f"# {project_id}: {blocks} blocks of delivered orthophotos, {horizontal}.",
+        "#",
+        "# Run it with:",
+        f"#   drone-photo process-project projects/{Workspace.project_slug(project_id)}.yaml",
+        "",
+        f"project_id: {project_id}",
+    ]
+    if source_root is not None:
+        lines += [
+            "",
+            "# An explicit path, so this file is specific to one machine. Remove it and put the",
+            "# blocks under DPP_INPUTS_ROOT instead if this is shared with anyone.",
+            f"source_root: {source_root.as_posix()}",
+        ]
+    lines += [
+        "source_type: DJI_TERRA",
+        f"asset: {asset}",
+        "",
+    ]
+    if declare_crs:
+        lines += [
+            "# From a delivery document, never from the imagery: the delivered files carry no",
+            "# vertical CRS. Declaring it records what the numbers already mean and reprojects",
+            "# nothing.",
+            f"declare_crs: {declare_crs}",
+            f"height_type: {height_type.value}",
+        ]
+    else:
+        lines += [
+            "# No vertical reference is declared, because no document states one. Leave it that",
+            "# way unless one turns up: a guessed datum is indistinguishable from a measured one",
+            "# for everyone downstream, and the two differ by tens of metres.",
+            "declare_crs: null",
+            "height_type: UNKNOWN",
+        ]
+    lines += [
+        "",
+        "# Unset: the overview's resolution is chosen from the survey's extent.",
+        "overview_gsd: null",
+        "preview_longest_side: 2048",
+        "destripe_previews: true",
+    ]
+    if notes:
+        lines += ["", f"notes: {notes}"]
+    return "\n".join(lines) + "\n"
 
 
 @app.command("ingest-ortho")
@@ -813,14 +1179,15 @@ def _build_project_overview(
     project_id: str,
     masters: list[tuple[str, Path]],
     *,
-    gsd: float = DEFAULT_GSD,
+    gsd: float | None = None,
     apply_destripe: bool = True,
     jpeg: bool = True,
 ) -> None:
     """Assemble one small browsable raster covering the whole project."""
     slug = Workspace.project_slug(project_id)
     console().print(
-        f"[bold]{project_id}[/bold]: assembling {len(masters)} blocks at {gsd:g} m"
+        f"[bold]{project_id}[/bold]: assembling {len(masters)} blocks at "
+        + (f"{gsd:g} m" if gsd is not None else "a resolution chosen from the extent")
         + ("  (destriping)" if apply_destripe else "")
     )
 
@@ -1388,8 +1755,15 @@ def previews(
 def overview(
     project_id: Annotated[str, typer.Option("--project-id", help="Project identifier.")],
     gsd: Annotated[
-        float, typer.Option("--gsd", help="Ground sample distance of the overview, in metres.")
-    ] = DEFAULT_GSD,
+        float | None,
+        typer.Option(
+            "--gsd",
+            help=(
+                "Ground sample distance of the overview, in metres. Chosen from the survey's "
+                "extent when not given, aiming for a 10,000 pixel long edge."
+            ),
+        ),
+    ] = None,
     apply_destripe: Annotated[
         bool, typer.Option("--destripe/--no-destripe", help="Remove flight-strip banding.")
     ] = True,
