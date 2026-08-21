@@ -189,17 +189,28 @@ class NodeODMClient:
         if not request.images:
             raise NodeODMError("a task needs at least one image")
 
-        data: dict[str, Any] = {
+        fields: dict[str, str] = {
             "name": request.name,
             "options": self._encode_options(request.options),
         }
         if request.outputs is not None:
-            data["outputs"] = json.dumps(list(request.outputs))
+            fields["outputs"] = json.dumps(list(request.outputs))
         if request.webhook:
-            data["webhook"] = request.webhook
+            fields["webhook"] = request.webhook
 
+        # Multipart, not form-encoded. `/task/new/init` is routed through `multer().none()`,
+        # which parses multipart/form-data only -- the engine's own urlencoded parser is wired
+        # to /task/cancel, /task/remove and /task/restart but not to this route. A form-encoded
+        # body is therefore discarded in full, silently and with a 200: every task created that
+        # way ran with the engine's defaults, no name, and none of the profile's options. Sending
+        # each field as a nameless multipart part is what httpx offers for text-only multipart.
         uuid = str(
-            self._json("POST", "/task/new/init", params=self._params(), data=data).get("uuid", "")
+            self._json(
+                "POST",
+                "/task/new/init",
+                params=self._params(),
+                files=[(key, (None, value)) for key, value in fields.items()],
+            ).get("uuid", "")
         )
         if not uuid:
             raise NodeODMError("NodeODM did not return a task uuid from /task/new/init")
@@ -228,7 +239,38 @@ class NodeODMClient:
 
         self._request("POST", f"/task/new/commit/{uuid}", params=self._params())
         logger.info("nodeodm task committed", extra={"uuid": uuid})
+        self._confirm_options(uuid, request.options)
         return uuid
+
+    def _confirm_options(self, uuid: str, wanted: dict[str, Any]) -> None:
+        """Read back what the engine recorded, and refuse a task that lost its options.
+
+        Validating option *names* against `/options` was not enough: it proves the engine knows
+        the option, not that the option arrived. A form-encoded body was accepted with a 200 and
+        discarded, so tasks ran under the engine's defaults while the manifest recorded a profile
+        that had never been applied. Nothing downstream could have detected that from the
+        product.
+
+        The engine adds defaults of its own, so this asserts that what was sent is present, not
+        that the two sets are equal.
+        """
+        if not wanted:
+            return
+        recorded = {
+            str(option.get("name")): option.get("value")
+            for option in (self.task_info(uuid).options or [])
+        }
+        missing = [
+            f"{name}={value!r} (engine has {recorded.get(name, 'nothing')!r})"
+            for name, value in ((key.lstrip("-"), value) for key, value in wanted.items())
+            if name not in recorded or not _same_option(recorded[name], value)
+        ]
+        if missing:
+            raise NodeODMError(
+                f"the engine did not record {len(missing)} of the {len(wanted)} options sent: "
+                f"{'; '.join(missing)}. The task was created but would run with different "
+                "settings than the profile asks for, so it is not usable evidence"
+            )
 
     # ---- task lifecycle -------------------------------------------------------------
 
@@ -310,6 +352,31 @@ class NodeODMClient:
         if options is not None:
             data["options"] = self._encode_options(options)
         self._request("POST", "/task/restart", params=self._params(), data=data)
+
+
+def _same_option(recorded: Any, sent: Any) -> bool:
+    """Whether the engine's value for an option matches what was sent.
+
+    Compared loosely on purpose: NodeODM round-trips values through JSON and a form, so a
+    boolean can come back as the string "true" and a number as "8". Being strict here would
+    reject working tasks, which is the opposite of the point.
+    """
+    if isinstance(sent, bool) or isinstance(recorded, bool):
+        return (
+            str(recorded).lower() in {"true", "1"}
+            if sent
+            else str(recorded).lower()
+            in {
+                "false",
+                "0",
+            }
+        )
+    if isinstance(sent, int | float) and not isinstance(sent, bool):
+        try:
+            return float(recorded) == float(sent)
+        except (TypeError, ValueError):
+            return False
+    return str(recorded) == str(sent)
 
 
 def _batched(items: Sequence[Path], size: int) -> Iterator[Sequence[Path]]:

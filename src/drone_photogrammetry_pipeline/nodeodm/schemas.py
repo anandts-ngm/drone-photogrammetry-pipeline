@@ -97,6 +97,12 @@ class TaskInfo(BaseModel):
     status: TaskStatus = Field(default_factory=TaskStatus)
     output: list[str] | None = None
 
+    # The options the engine actually recorded, as [{"name": ..., "value": ...}]. Declared
+    # rather than left to `extra` because a task's real settings are read back and checked
+    # against what was sent: a request body the engine discards is accepted with a 200, and this
+    # is the only place the difference is visible.
+    options: list[dict[str, Any]] | None = None
+
     @property
     def code(self) -> TaskStatusCode | None:
         return self.status.status

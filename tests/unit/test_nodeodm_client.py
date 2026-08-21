@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -120,11 +119,55 @@ def test_option_names_are_checked_against_the_running_engine() -> None:
     assert unknown == ["invented-option"]
 
 
+def multipart_fields(request: httpx.Request) -> dict[str, str]:
+    """The text fields of a multipart body, or nothing if the body is not multipart.
+
+    Stands in for the engine's `multer().none()`, which is the whole point: NodeODM routes
+    `/task/new/init` through a parser that reads multipart/form-data and nothing else. A
+    form-encoded body reaches it as no fields at all, which is how every option this repository
+    sent was discarded under an HTTP 200.
+    """
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" not in content_type or "boundary=" not in content_type:
+        return {}
+    boundary = content_type.split("boundary=", 1)[1].split(";")[0]
+    fields: dict[str, str] = {}
+    for chunk in request.content.split(f"--{boundary}".encode()):
+        if b'name="' not in chunk:
+            continue
+        header, _, body = chunk.partition(b"\r\n\r\n")
+        name = header.split(b'name="', 1)[1].split(b'"', 1)[0].decode()
+        fields[name] = body.rstrip(b"\r\n-").decode(errors="replace")
+    return fields
+
+
 def new_task_routes(uuid: str = "abc-123") -> dict[str, Any]:
+    """Routes that behave like the engine: only a multipart init carries options through."""
+    recorded: dict[str, Any] = {"options": [], "name": ""}
+
+    def init(request: httpx.Request) -> httpx.Response:
+        fields = multipart_fields(request)
+        recorded["name"] = fields.get("name", "")
+        recorded["options"] = json.loads(fields["options"]) if "options" in fields else []
+        return httpx.Response(200, json={"uuid": uuid})
+
+    def info(_request: httpx.Request) -> httpx.Response:
+        # The engine adds defaults of its own, which is why the check is containment.
+        return httpx.Response(
+            200,
+            json={
+                "uuid": uuid,
+                "name": recorded["name"],
+                "options": [*recorded["options"], {"name": "cog", "value": True}],
+                "status": {"code": 20},
+            },
+        )
+
     return {
-        "/task/new/init": httpx.Response(200, json={"uuid": uuid}),
+        "/task/new/init": init,
         "/task/new/upload": httpx.Response(200, json={"success": True}),
         "/task/new/commit": httpx.Response(200, json={"uuid": uuid}),
+        f"/task/{uuid}/info": info,
     }
 
 
@@ -150,11 +193,83 @@ def test_options_are_encoded_in_the_shape_nodeodm_expects(tmp_path: Path) -> Non
         TaskRequest(name="B064", images=images(tmp_path, 1), options={"dsm": True, "--crop": 0})
     )
 
-    form = parse_qs(recorder.calls[0].content.decode())
-    encoded = json.loads(form["options"][0])
+    encoded = json.loads(multipart_fields(recorder.calls[0])["options"])
     assert {"name": "dsm", "value": True} in encoded
     # A leading double dash is stripped: profiles may write either form.
     assert {"name": "crop", "value": 0} in encoded
+
+
+def test_the_init_body_is_multipart_because_the_engine_parses_nothing_else(
+    tmp_path: Path,
+) -> None:
+    """The bug this pins cost two P1 reconstructions and produced a false provenance record.
+
+    `/task/new/init` is routed through `multer().none()`, which reads multipart/form-data only.
+    A form-encoded body was accepted with HTTP 200 and discarded whole, so tasks ran under the
+    engine's defaults -- including the global colour normalisation the analytical policy
+    forbids -- while the manifest recorded a profile that had never been applied.
+    """
+    recorder = Recorder(new_task_routes())
+
+    client(recorder).create_task(
+        TaskRequest(name="B064", images=images(tmp_path, 1), options={"dsm": True})
+    )
+
+    init = recorder.calls[0]
+    assert init.url.path == "/task/new/init"
+    assert "multipart/form-data" in init.headers.get("content-type", "")
+    assert multipart_fields(init)["name"] == "B064", "the task name travels in the same body"
+
+
+def test_a_task_whose_options_the_engine_did_not_record_is_refused(tmp_path: Path) -> None:
+    """Validating option names proved the engine knows them, not that they arrived.
+
+    Reading them back is what closes that gap, and it has to fail loudly: a task that runs with
+    different settings than the profile asks for is not evidence of anything.
+    """
+    routes = new_task_routes()
+    routes["/task/abc-123/info"] = httpx.Response(
+        200,
+        json={
+            "uuid": "abc-123",
+            "options": [{"name": "cog", "value": True}],
+            "status": {"code": 20},
+        },
+    )
+    recorder = Recorder(routes)
+
+    with pytest.raises(NodeODMError, match="did not record"):
+        client(recorder).create_task(
+            TaskRequest(name="B064", images=images(tmp_path, 1), options={"dsm": True})
+        )
+
+
+def test_a_value_the_engine_round_trips_as_a_string_still_matches(tmp_path: Path) -> None:
+    """NodeODM puts values through JSON and a form, so `8` can come back as `"8"`.
+
+    Being strict here would reject working tasks, which is the opposite of the point.
+    """
+    routes = new_task_routes()
+    routes["/task/abc-123/info"] = httpx.Response(
+        200,
+        json={
+            "uuid": "abc-123",
+            "options": [
+                {"name": "max-concurrency", "value": "8"},
+                {"name": "dsm", "value": "true"},
+            ],
+            "status": {"code": 20},
+        },
+    )
+    recorder = Recorder(routes)
+
+    uuid = client(recorder).create_task(
+        TaskRequest(
+            name="B064", images=images(tmp_path, 1), options={"max-concurrency": 8, "dsm": True}
+        )
+    )
+
+    assert uuid == "abc-123"
 
 
 def test_outputs_restricts_what_the_archive_will_contain(tmp_path: Path) -> None:

@@ -30,7 +30,7 @@ from drone_photogrammetry_pipeline.processing.odm import (
     wanted_outputs,
 )
 from tests.unit.test_block_scan import flat_flight
-from tests.unit.test_nodeodm_client import Recorder
+from tests.unit.test_nodeodm_client import Recorder, new_task_routes
 
 ENGINE_OPTIONS = [
     {"name": "dsm"},
@@ -64,12 +64,12 @@ def node(recorder: Recorder) -> NodeODMClient:
 
 
 def task_routes() -> dict[str, Any]:
-    return {
-        "/options": httpx.Response(200, json=ENGINE_OPTIONS),
-        "/task/new/init": httpx.Response(200, json={"uuid": "task-1"}),
-        "/task/new/upload": httpx.Response(200, json={"success": True}),
-        "/task/new/commit": httpx.Response(200, json={"uuid": "task-1"}),
-    }
+    """The engine's task-creation routes, including the info the client reads options back from.
+
+    Shares `new_task_routes` with the client tests rather than restating the shapes, so a change
+    in how the engine is modelled reaches both files at once.
+    """
+    return {"/options": httpx.Response(200, json=ENGINE_OPTIONS), **new_task_routes("task-1")}
 
 
 def test_radiometry_options_win_over_processing_options() -> None:
