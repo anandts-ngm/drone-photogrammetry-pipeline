@@ -282,14 +282,16 @@ survey to a common coarser grid is a decision about the product, not a detail of
 A P1 folder arrives as raw imagery plus a `Timestamp.MRK` event-mark file, and the obvious move
 is to turn the mark file into ODM's `geo.txt`. Reading ODM's own source says not to.
 
-**What ODM already does.** `opendm/photo.py` reads `@drone-dji:RtkStdLon`, `RtkStdLat` and
-`RtkStdHgt` from each image's XMP and sets that image's `gps_xy_stddev` to the larger of the
-two horizontal values and `gps_z_stddev` from the height. On the measured block those are
-1.3 cm to 2.3 cm, per image. `--gps-accuracy` (default **3 m**, not 10) is only the fallback
-for imagery that carries no such tags.
+**What ODM already does.** Verified inside the running container rather than from the project's
+GitHub master, 2026-08-21, ODM 3.5.6: `/code/opendm/photo.py:397-403` reads
+`@drone-dji:RtkStdLon`, `RtkStdLat` and `RtkStdHgt` from each image's XMP and sets that image's
+`gps_xy_stddev` to the larger of the two horizontal values and `gps_z_stddev` from the height,
+then doubles both at line 441. On the measured block those are 1.3 cm to 2.3 cm, per image.
+`--gps-accuracy` (default **3 m**, not 10, confirmed in the task log) is only the fallback for
+imagery that carries no such tags.
 
-**What a geo file would cost.** `GeoFile` parses
-`filename x y [z] [yaw pitch roll] [horiz_acc vert_acc]`, and `update_with_geo_entry` assigns
+**What a geo file would cost.** `/code/opendm/geo.py:30-53` parses
+`filename x y [z] [yaw pitch roll] [horiz_acc vert_acc]`, and `photo.py:199` assigns
 `gps_xy_stddev = geo_entry.horizontal_accuracy` unconditionally. A four-column file therefore
 *clears* the per-image RTK weighting ODM had just read, dropping the block back to the 3 m
 default. Filling the accuracy columns is not available either: they sit behind the attitude
@@ -369,6 +371,75 @@ adds bytes and no detail). Measured:
 A cap rather than a target, because the failure that matters is a browse image too large to
 browse. Sant lands on the 0.5 m it was given; Buduunkhad becomes 1 m, which is the intended
 change. Only a derived viewing product is affected, so nothing measured depends on it.
+
+### 2.19 Radiometry thresholds frozen at 15 % / 30 % — **DECIDED**
+
+Derived rather than chosen, from two directions that agree: the distribution of a delivery that
+was accepted and shipped, and what the sRGB transfer function says a difference in light looks
+like on screen. The full derivation, the calibration table and the eight failing pairs are in
+`docs/radiometry.md` §7.
+
+Three consequences worth stating here:
+
+* **Only linearised measurements are graded.** The same imagery measures 7.3 % median
+  disagreement in encoded values and 16.5 % in linear light, so one calibration cannot serve
+  both spaces. An encoded report stays `NOT_EVALUATED` with a note saying to re-measure.
+* **A report's grade is the worst of its pairs**, not an average. A project is as consistent as
+  its least consistent join.
+* **`process-project` does not gate on it.** The response to a poor source measurement is to
+  correct it, which is what that command does next. `radiometry` exits with the grade.
+
+The gate tracks what it exists to check: 56 FAIL before correction, 8 after, on the same 231
+pairs.
+
+### 2.20 One command per raw block, and a progress bar with an estimate — **DECIDED**
+
+`run-block` chains validate, submit, follow, download, package and QA for imagery this pipeline
+reconstructs itself. It shares `_retrieve_and_package` with `fetch`, so a reconstruction
+packaged either way reaches the same product with the same manifest. Interrupting it loses only
+the watching: the task continues on the engine and `fetch <task id>` collects it, which matters
+when a reconstruction runs for an hour.
+
+The progress bars are byte-weighted where the work is proportional to bytes, because these
+blocks span a factor of four in size and counting them would make the estimate lurch every time
+a small one went past. They are silent when the output is not a terminal: a redirected run's log
+is evidence, and a live bar written into it is thousands of lines of cursor movement over the
+per-block records that matter. ODM's own percentage drives the reconstruction bar, with each
+stage change printed beside it — the percentage alone implies a linearity the stages do not have.
+
+### 2.21 The ODM route must be told to produce native resolution — **DECIDED, measured**
+
+The first real P1 reconstruction, 79 images through ODM 3.5.6, packaged to a master that passed
+all fourteen raster-contract checks — at **5.0 cm/px**, from imagery whose native ground sample
+distance is **1.50 cm** (full-frame 8192 px across 35.9 mm, 35 mm lens, 120 m relative
+altitude). Three times coarser linearly, eleven times in area, and nothing in the output says
+so.
+
+The cause is ODM's `orthophoto-resolution` default of 5 cm/px, which the profiles were leaving
+alone on the grounds that resolutions are tuning values. That reasoning was wrong: the master
+contract requires native resolution, so a coarser engine output is a contract violation, not a
+tuning preference. All four ODM profiles now pin `orthophoto-resolution: 1.0` with
+`ignore-gsd: false`, which asks for finer than any of these flights can deliver and lets the
+engine clamp to what the imagery actually supports. Profile versions bumped 1 → 2.
+
+`dem-resolution` is deliberately left at ODM's 5 cm. A DSM at 1.5 cm from photogrammetry is
+mostly noise, and for the L cameras the LiDAR path is authoritative for elevation anyway.
+
+### 2.22 A P1 folder is a flight strip, not a block — **measured 2026-08-21**
+
+`DJI_202608031301_013_B084` holds 79 exposures spanning **16 m north-south by 106 m east-west**:
+one east-west line, 3 m between shots. Its mark file covers the whole flight, 649 exposures over
+**103 m by 109 m** — about 1.1 ha imaged from 120 m with roughly seventeen passes 6 m apart.
+
+Two things follow for anyone running the P1 path:
+
+* **The processing unit is the flight, not the folder.** Reconstructing this folder alone
+  produced a valid master covering 0.4 ha — a correct product of one strip, and not the block.
+  A complete block needs every folder from that flight submitted together; only one is held
+  locally, so no complete P1 block has been reconstructed yet.
+* **The acquisition is a dense small-target survey**, not a broad mapping flight. That is
+  consistent with the earlier area measurement: 352.3 ha of P1 across all blocks, median 2.51 ha
+  each, against the L cameras' 6,285 ha. Whatever these blocks are for, it is not area coverage.
 
 ### 2.6 Deviations from the proposed repository tree
 
@@ -497,10 +568,10 @@ simply be the measurement floor rather than a correctable effect.
 | # | Question | How it will be verified |
 |---|---|---|
 | ~~V1~~ | Semantics of the `outputs` parameter | **RESOLVED.** NodeODM's API definition: *"An optional serialized JSON string of paths relative to the project directory that should be included in the all.zip result file, overriding the default behavior."* Exactly the lever needed. The client sends it as a JSON array of paths. Still worth an empirical check against a running node with a tiny dataset. |
-| V2 | Which ODM version is actually inside the pinned digest | `GET /info` on the running container (`engineVersion`). The compose file now pins `opendronemap/nodeodm@sha256:8845ee48…` (`latest` as resolved 2026-08-18), and every run records `engineVersion` in its manifest, so what actually ran is always known regardless of what the compose file says. |
-| V3 | Is the DJI Zenmuse P1 (35 mm and 50 mm) present in ODM's sensor database, and are XMP yaw/pitch/roll read correctly? | Process a real P1 block; inspect ODM logs for unknown-camera warnings and `cameras.json` |
+| ~~V2~~ | Which ODM version is actually inside the pinned digest | **RESOLVED 2026-08-21.** `GET /info` on the running container: **odm 3.5.6, NodeODM 2.2.4**. All four sensor profiles' options were checked against its 81 exposed options with `unknown_options`: none unknown, so nothing in a profile is being silently ignored. Every run still records `engineVersion` in its manifest. |
+| V3 | Is the DJI Zenmuse P1 (35 mm and 50 mm) present in ODM's sensor database, and are XMP yaw/pitch/roll read correctly? | **Largely answered 2026-08-21** on the 79-image B084 block: no unknown-camera warning, `cameras: {}` and `camera_lens: auto`, all 79 images entered the reconstruction, and OpenSfM reported "Shots and/or GCPs are well-conditioned" throughout. Closes fully when the orthophoto is packaged. The 50 mm lens is still untested. |
 | V4 | Is the L2 RGB camera (4/3 CMOS) in the sensor database? | Same method, real L2 block |
-| V5 | Actual band layout of a real ODM P1 orthophoto — band count, alpha tagging, NoData presence | `gdalinfo` / Rasterio on a real output; drives which row of the alpha decision table applies |
+| ~~V5~~ | Actual band layout of a real ODM P1 orthophoto — band count, alpha tagging, NoData presence | **RESOLVED 2026-08-21** on a real 79-image P1 reconstruction: 4 bands, colour interpretation red/green/blue/**alpha** correctly tagged, NoData unset on all four bands, DEFLATE, tiled, BigTIFF, EPSG:32647, no overviews. It needed no alpha derivation and no NoData reconciliation -- the first row of the alpha decision table applies. |
 | ~~V6~~ | Characteristics of a real DJI Terra DOM export | **RESOLVED — see §3.1.2** |
 | V8 | Does `PREDICTOR=2` with `BIGTIFF=YES` behave identically across the GDAL versions in ODM's container and in our packager | Round-trip a fixture and compare pixel checksums. **Half-answered:** our side round-trips RGB band checksums unchanged (`--verify-pixels`, covered by tests). The ODM-container side still needs a real ODM output. |
 | V9 | Whether L-camera RGB from a LiDAR-parameterised flight has usable overlap for ODM reconstruction | Benchmark processing on a real L2/L3 block |

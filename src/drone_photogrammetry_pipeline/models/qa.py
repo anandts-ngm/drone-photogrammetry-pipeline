@@ -110,8 +110,9 @@ class RadiometricPairResult(BaseModel):
     patch_metres: float
     bands: list[BandDifference] = Field(default_factory=list)
 
-    # No threshold is frozen yet, so no pair is judged. Establishing one is a benchmark
-    # exercise, not a guess: see docs/radiometry.md.
+    # Graded against thresholds derived in `qa.radiometry`, or left NOT_EVALUATED when the pair
+    # was measured in encoded values, where those thresholds do not apply. Defaults to
+    # NOT_EVALUATED so reports written before the thresholds existed keep their meaning.
     status: GateStatus = GateStatus.NOT_EVALUATED
     note: str = ""
 
@@ -147,3 +148,22 @@ class RadiometricOverlapReport(BaseModel):
     @property
     def measured(self) -> list[RadiometricPairResult]:
         return [p for p in self.pairs if p.sample_pixels > 0]
+
+    def count_by_status(self) -> dict[GateStatus, int]:
+        counts = dict.fromkeys(GateStatus, 0)
+        for pair in self.measured:
+            counts[pair.status] += 1
+        return counts
+
+    @property
+    def status(self) -> GateStatus:
+        """The worst grade any measured pair received.
+
+        The worst rather than an average: a project is as consistent as its least consistent
+        join, and averaging would let one unusable pair disappear into two hundred good ones.
+        """
+        counts = self.count_by_status()
+        for status in (GateStatus.FAIL, GateStatus.REVIEW, GateStatus.PASS):
+            if counts[status]:
+                return status
+        return GateStatus.NOT_EVALUATED

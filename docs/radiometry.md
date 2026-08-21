@@ -1,6 +1,6 @@
 # Radiometric policy
 
-Status: draft for review. Policy is defined here; thresholds are deliberately not frozen.
+Status: draft for review. Policy is defined here; the pass thresholds are derived in section 7.
 
 ---
 
@@ -98,8 +98,8 @@ Consequences, all recorded in the manifest rather than assumed away:
 ## 6. Overlap QA — implemented
 
 `drone-photo radiometry <project-dir> --project-id <id>` measures how much every pair of
-overlapping blocks disagrees about the ground they share. It reports numbers and judges
-nothing.
+overlapping blocks disagrees about the ground they share, and grades each pair against the
+thresholds derived in section 7.
 
 ### Why it is built this way
 
@@ -139,7 +139,8 @@ median_a, median_b
 median_difference                    (DN)
 relative_difference_pct              symmetric, so swapping the blocks only flips the sign
 robust_normalized_difference_pct     median of the per-sample symmetric difference
-status                               NOT_EVALUATED, always, for now
+status                               PASS / REVIEW / FAIL, or NOT_EVALUATED when the
+                                     measurement was not linearised (see section 7)
 ```
 
 ### Reading the result
@@ -306,18 +307,85 @@ Design constraints already fixed:
 - Report per-band as well as combined. A uniform brightness offset and a colour cast are
   different defects with different causes.
 
-## 7. Thresholds are not frozen
+## 7. Thresholds — derived 2026-08-21
 
-No permanent PASS threshold is defined yet. Setting one now would be guessing.
+**REVIEW above 15 %, FAIL above 30 %**, on a pair's mean absolute band difference measured in
+linear light. Two independent derivations agree on that pair of numbers, which is why they are
+the ones frozen.
 
-The initial validation datasets are the known cases:
+### Derivation 1: what an accepted delivery looks like
+
+The corrected Buduunkhad masters are the reference set — 79 blocks that passed the raster
+contract and were delivered — measured over 231 overlapping pairs. Share of pairs at or below
+each candidate:
+
+| report | n | ≤5 % | ≤10 % | ≤15 % | ≤20 % | ≤25 % | ≤30 % | ≤40 % |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Buduunkhad sources, linear | 231 | 16 % | 31 % | 48 % | 58 % | 69 % | 76 % | 87 % |
+| **Buduunkhad corrected, linear** | 231 | 42 % | 67 % | **79 %** | 87 % | 94 % | **97 %** | 98 % |
+| Buduunkhad sources, encoded | 232 | 34 % | 64 % | 78 % | 89 % | 96 % | 98 % | 98 % |
+| Sant sources, linear | 20 | 5 % | 10 % | 30 % | 35 % | 55 % | 70 % | 85 % |
+
+A gate at 5 % would fail more than half of a delivery already judged good, which would be
+measuring the wrong thing. At 15/30 the reference set comes out 182 PASS, 41 REVIEW, 8 FAIL.
+
+The eight failures are not sampling noise. Each is a coherent all-band level difference over a
+large shared area:
 
 ```text
-B64 / B66     known compatible, 2.2 %
-B44 / B51     11.0 % median, 422 pairs
-N3  / N7      15.1 % median, 20 pairs
+B70/B74   65.2 %   51.7 ha    R +69.3  G +64.3  B +61.9
+B44/B52   57.1 %   63.9 ha    R +57.1  G +57.7  B +56.6
+B42/B47   43.2 %  106.7 ha    R +43.6  G +42.7  B +43.4
+B4 /B6    42.3 %   19.4 ha    R -41.4  G -40.9  B -44.5
 ```
 
-Thresholds are derived from these benchmarks once the pipeline can measure them
-consistently, and the derivation is documented alongside the numbers. Until then, overlap
-QA reports values and marks status `NOT_EVALUATED` rather than inventing a verdict.
+These survive per-block gain correction because a block that needs +40 % against one neighbour
+and −40 % against another cannot satisfy both; the network adjustment splits the difference.
+That is the known limit of one gain per block, not a defect in the gate.
+
+### Derivation 2: what a viewer can see
+
+Deliveries are display-referred, so a difference in light is compressed on screen. Through the
+sRGB transfer function at mid grey (DN 128):
+
+| difference in light | DN 128 becomes | on screen |
+|---:|---:|---:|
+| 5 % | 130.9 | 2.3 % |
+| 10 % | 133.8 | 4.5 % |
+| **15 %** | 136.5 | **6.7 %** |
+| 20 % | 139.2 | 8.8 % |
+| **30 %** | 144.4 | **12.8 %** |
+| 65 % | 161.0 | 25.7 % |
+
+15 % in light is a 6.7 % step on screen, around where a seam stops being invisible; 30 % is
+12.8 %, where it is unmistakable.
+
+### Why only linear light is judged
+
+The same percentage means different things in the two spaces: the identical Buduunkhad imagery
+measures a 7.3 % median disagreement in encoded values and 16.5 % in linear light. One
+calibration cannot serve both, and inventing a second one for a space nothing is solved in
+would be worse than declining. A pair measured without `--linearise` therefore stays
+`NOT_EVALUATED`, with a note saying so.
+
+### What the gate does and does not do
+
+- The measurement floor is about **0.3 %** — the best-overlapping pairs here reach 0.24–0.6 %,
+  so the method discriminates far more finely than these thresholds ask.
+- A report's grade is the **worst** of its pairs. A project is as consistent as its least
+  consistent join, and an average would let one unusable pair disappear into two hundred good
+  ones.
+- `radiometry` exits with that grade: 0 PASS, 2 REVIEW, 1 FAIL.
+- `process-project` does **not** gate on it. The response to a poor source measurement is to
+  correct it, which is what that command then does; refusing to package would leave the
+  operator with nothing.
+
+The gate tracks the correction it exists to check: on the same 231 pairs it reports 56 FAIL
+before correction and 8 after.
+
+### Still open
+
+The reference set is one delivery. A second corrected survey — Sant, once measured after
+correction rather than before — would say whether 15/30 travels, or whether it is calibrated to
+Buduunkhad's terrain and acquisition. The thresholds are frozen, not final; changing them means
+repeating this derivation and saying so here.

@@ -5,7 +5,7 @@
 # must be tunable independently even while every setting below happens to match today.
 
 profile_id: p1_50_master
-profile_version: 1
+profile_version: 2
 
 sensor: P1_50
 lens: "50mm"
@@ -15,6 +15,16 @@ processing:
   odm:
     dsm: true
     dtm: false
+    # Ask for finer than any of these flights can deliver, and let the engine clamp.
+    #
+    # ODM's default is 5 cm/px, which on a real P1 block measured here produced a 5.0 cm master
+    # from imagery whose native ground sample distance is 1.50 cm -- three times coarser
+    # linearly, eleven times in area, and silently. `ignore-gsd: false` keeps ODM from going
+    # finer than the imagery supports, so asking for 1 cm yields the native resolution rather
+    # than an interpolated one. The master contract requires native; this is what enforces it
+    # on the ODM route.
+    orthophoto-resolution: 1.0
+    ignore-gsd: false
 
 radiometry:
   policy: analytical_master

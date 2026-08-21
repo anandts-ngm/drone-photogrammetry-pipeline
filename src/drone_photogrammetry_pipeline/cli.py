@@ -7,12 +7,25 @@ result and the JSONL processing log written under the workspace, never this outp
 from __future__ import annotations
 
 import shutil
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    MofNCompleteColumn,
+    Progress,
+    ProgressColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.table import Table
 
 from . import __version__
@@ -78,6 +91,8 @@ from .qa.radiometry import (
     DEFAULT_MIN_OVERLAP_HA,
     DEFAULT_PATCH_METRES,
     DEFAULT_PATCHES,
+    PAIR_FAIL_PCT,
+    PAIR_REVIEW_PCT,
     measure_project,
 )
 from .qa.raster import run_raster_qa
@@ -163,6 +178,43 @@ def _check_one_grid(sources: list[SourceShape]) -> None:
         "in its own directory with its own project id."
     )
     raise typer.Exit(EXIT_FAIL)
+
+
+@contextmanager
+def _progress(label: str, total: float, *, unit: str) -> Iterator[Callable[[float], None]]:
+    """A live bar with an ETA, yielding the function that advances it.
+
+    Silent when the output is not a terminal. A redirected run's log is evidence, and a live bar
+    written into it is thousands of lines of cursor movement over the per-block records that
+    matter.
+
+    Progress is measured in bytes where the work is proportional to bytes, because these blocks
+    range over a factor of four in size and counting them would make the estimate swing every
+    time a small one went by.
+    """
+    if not console().is_terminal or total <= 0:
+        yield lambda _amount: None
+        return
+
+    columns: list[ProgressColumn] = [
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=28),
+        TaskProgressColumn(),
+    ]
+    if unit == "bytes":
+        columns.append(DownloadColumn(binary_units=True))
+    elif unit == "blocks":
+        columns.append(MofNCompleteColumn())
+    columns += [
+        TextColumn("elapsed"),
+        TimeElapsedColumn(),
+        TextColumn("eta"),
+        TimeRemainingColumn(),
+    ]
+
+    with Progress(*columns, console=console(), transient=True) as bar:
+        task = bar.add_task(label, total=total)
+        yield lambda amount: bar.advance(task, amount)
 
 
 def _free_bytes(path: Path) -> int:
@@ -887,6 +939,36 @@ def fetch(
     verify_pixels: Annotated[bool, typer.Option("--verify-pixels")] = False,
 ) -> None:
     """Download a finished task, package its orthophoto and run QA."""
+    outcome = _retrieve_and_package(
+        task_uuid,
+        project_id=project_id,
+        block_id=block_id,
+        profile_id=profile_id,
+        node_url=node_url,
+        declare_crs=declare_crs,
+        height_type=height_type,
+        verify_pixels=verify_pixels,
+    )
+    raise typer.Exit(_EXIT_FOR_STATUS[outcome.gate_status])
+
+
+def _retrieve_and_package(
+    task_uuid: str,
+    *,
+    project_id: str,
+    block_id: str,
+    profile_id: str,
+    node_url: str | None,
+    declare_crs: str | None,
+    height_type: HeightType,
+    verify_pixels: bool,
+) -> IngestOutcome:
+    """Download a finished ODM task and take its orthophoto through to a master.
+
+    Shared by `fetch` and `run-block` so that a reconstruction packaged by either arrives at
+    the same product with the same manifest. The engine's own version is recorded from the run
+    rather than from the compose file, so what actually produced the pixels is always known.
+    """
     settings = get_settings()
     workspace = Workspace(settings.workspace_root)
     loaded = load_profile(settings.profiles_dir, profile_id)
@@ -921,6 +1003,142 @@ def fetch(
     console().print(f"engine:   odm {result.odm_version}")
     console().print(f"master:   {outcome.master_path}")
     console().print(f"manifest: {outcome.manifest_path}")
+    return outcome
+
+
+@app.command("run-block")
+def run_block(
+    root: Annotated[
+        Path,
+        typer.Argument(exists=True, file_okay=False, help="Block directory of raw imagery."),
+    ],
+    project_id: Annotated[str, typer.Option("--project-id", help="Project identifier.")],
+    profile_id: Annotated[
+        str, typer.Option("--profile", help="Processing profile id, e.g. p1_35_master.")
+    ],
+    block_id: Annotated[
+        str | None,
+        typer.Option("--block-id", help="Block identifier; defaults to the folder name."),
+    ] = None,
+    geo: Annotated[
+        Path | None,
+        typer.Option(
+            "--geo",
+            exists=True,
+            dir_okay=False,
+            help="A geo.txt to upload with the imagery, as written by 'p1-geo --write-geo'.",
+        ),
+    ] = None,
+    declare_crs: Annotated[
+        str | None,
+        typer.Option("--declare-crs", help="CRS to write on the master, from a document."),
+    ] = None,
+    height_type: Annotated[
+        HeightType, typer.Option("--height-type", help="Vertical reference of the delivery.")
+    ] = HeightType.UNKNOWN,
+    poll_seconds: Annotated[
+        float, typer.Option("--poll-seconds", help="How often to ask the engine for progress.")
+    ] = 15.0,
+    node_url: Annotated[str | None, typer.Option("--node")] = None,
+) -> None:
+    """Reconstruct one block of raw imagery and package the result, in one command.
+
+    Validate, submit, follow, download, package, QA. This is the path for imagery this
+    pipeline reconstructs itself -- a DJI P1 flight, or L-camera RGB -- as opposed to
+    `process-project`, which ingests orthophotos somebody else produced.
+
+    Interrupting it loses only the waiting: the task keeps running on the engine, and
+    `drone-photo fetch <task id>` picks the result up afterwards.
+    """
+    settings = get_settings()
+    workspace = Workspace(settings.workspace_root)
+    workspace.guard_source(root)
+
+    block = scan_block(root, block_id=block_id)
+    validated = validate_block(block)
+    loaded = load_profile(settings.profiles_dir, profile_id)
+    identifier = block_id or block.block_id
+
+    console().print(
+        f"[bold]{identifier}[/bold]  {block.image_count} images, "
+        f"{len(block.navigation)} navigation, profile {loaded.profile.profile_id}"
+    )
+    if not validated.is_processable:
+        for finding in validated.fatal:
+            error_console().print(f"  [red]{finding.name}[/red]: {finding.detail}")
+        raise typer.Exit(EXIT_FAIL)
+    if not validated.suitable_for_absolute_z and declare_crs is None:
+        console().print(
+            "[yellow]no vertical reference[/yellow]: the master will carry none, and nothing "
+            "downstream may claim an absolute height result"
+        )
+
+    with NodeODMClient(node_url or settings.nodeodm_url) as client:
+        if not client.health():
+            error_console().print(
+                f"no NodeODM at {node_url or settings.nodeodm_url}; "
+                "run 'docker compose up -d' first"
+            )
+            raise typer.Exit(EXIT_FAIL)
+        node = client.info()
+        console().print(f"engine:   {node.engine} {node.engineVersion} (NodeODM {node.version})")
+
+        try:
+            uuid = submit(
+                validated,
+                loaded.profile,
+                client,
+                extra_uploads=[geo] if geo is not None else [],
+            )
+        except (OdmProcessingError, NodeODMError) as error:
+            error_console().print(f"[bold red]FAILED[/bold red] {error}")
+            raise typer.Exit(EXIT_FAIL) from error
+
+        console().print(f"task:     {uuid}")
+        console().print(
+            f"[dim]following. Ctrl-C stops watching, not the task: "
+            f"drone-photo fetch {uuid} picks it up[/dim]"
+        )
+
+        # ODM reports an absolute percentage, so the bar is advanced by the difference. Its
+        # stages are wildly unequal in duration, which is why the engine's own message is
+        # printed alongside: the percentage alone would suggest a linearity that is not there.
+        with _progress("reconstructing", 100.0, unit="percent") as advance:
+            seen = 0.0
+            last_stage = ""
+
+            def watch(info: Any) -> None:
+                nonlocal seen, last_stage
+                advance(max(0.0, info.progress - seen))
+                seen = max(seen, info.progress)
+                stage = info.code.name if info.code else "UNKNOWN"
+                if stage != last_stage:
+                    console().print(f"[dim]  {info.progress:5.1f}%  {stage}[/dim]")
+                    last_stage = stage
+
+            try:
+                final = client.wait(uuid, poll_seconds=poll_seconds, on_progress=watch)
+            except NodeODMError as error:
+                error_console().print(f"[bold red]FAILED[/bold red] {error}")
+                raise typer.Exit(EXIT_FAIL) from error
+
+    if not final.is_success:
+        error_console().print(
+            f"[bold red]the engine did not finish[/bold red]: "
+            f"{final.status.errorMessage or (final.code.name if final.code else 'unknown')}"
+        )
+        raise typer.Exit(EXIT_FAIL)
+
+    outcome = _retrieve_and_package(
+        uuid,
+        project_id=project_id,
+        block_id=identifier,
+        profile_id=profile_id,
+        node_url=node_url,
+        declare_crs=declare_crs,
+        height_type=height_type,
+        verify_pixels=False,
+    )
     raise typer.Exit(_EXIT_FOR_STATUS[outcome.gate_status])
 
 
@@ -1065,27 +1283,32 @@ def _package_blocks(
     started_at = datetime.now(UTC)
     outcomes: list[IngestOutcome] = []
 
-    for index, (block_id, source_path) in enumerate(blocks, start=1):
-        outcome = ingest_external_to_master(
-            IngestRequest(
-                source_path=source_path,
-                source_type=source_type,
-                project_id=project_id,
-                block_id=block_id,
-                profile_id=profile_id,
-                allow_alpha_from_nodata=allow_alpha_from_nodata,
-                verify_pixels=verify_pixels,
-                declare_crs=declare_crs,
-                height_type=height_type,
-                sensor=sensor,
-                correction=(correction_for(solution, block_id) if solution is not None else None),
-            ),
-            settings,
-            workspace=workspace,
-            reuse_completed=not force,
-        )
-        outcomes.append(outcome)
-        _render_block_line(index, len(blocks), outcome)
+    total_bytes = sum(path.stat().st_size for _, path in blocks)
+    with _progress("packaging", total_bytes, unit="bytes") as advance:
+        for index, (block_id, source_path) in enumerate(blocks, start=1):
+            outcome = ingest_external_to_master(
+                IngestRequest(
+                    source_path=source_path,
+                    source_type=source_type,
+                    project_id=project_id,
+                    block_id=block_id,
+                    profile_id=profile_id,
+                    allow_alpha_from_nodata=allow_alpha_from_nodata,
+                    verify_pixels=verify_pixels,
+                    declare_crs=declare_crs,
+                    height_type=height_type,
+                    sensor=sensor,
+                    correction=(
+                        correction_for(solution, block_id) if solution is not None else None
+                    ),
+                ),
+                settings,
+                workspace=workspace,
+                reuse_completed=not force,
+            )
+            outcomes.append(outcome)
+            _render_block_line(index, len(blocks), outcome)
+            advance(outcome.source_bytes)
 
     summary = ProjectRunSummary(
         project_id=project_id,
@@ -1123,35 +1346,38 @@ def _render_previews(
     rendered: list[tuple[str, Any]] = []
     written = 0
     reductions: list[float] = []
-    for index, (block_id, master) in enumerate(masters, start=1):
-        try:
-            preview, image, destriped = write_preview(
-                master,
-                directory / f"{block_id}_preview.jpg",
-                longest_side=longest_side,
-                quality=quality,
-                apply_destripe=apply_destripe,
+    with _progress("previews", len(masters), unit="blocks") as advance:
+        for index, (block_id, master) in enumerate(masters, start=1):
+            try:
+                preview, image, destriped = write_preview(
+                    master,
+                    directory / f"{block_id}_preview.jpg",
+                    longest_side=longest_side,
+                    quality=quality,
+                    apply_destripe=apply_destripe,
+                )
+            except PreviewError as error:
+                # One unreadable master costs its own preview, not the other 78. That block
+                # still has its master and its manifest; only the picture is missing.
+                error_console().print(f"[yellow]{block_id}: {error}[/yellow]")
+                advance(1)
+                continue
+            written += preview.bytes_written
+            rendered.append((block_id, image))
+            # Reported per block rather than only in aggregate: a block whose banding barely
+            # moved is worth seeing, because the ripple there was not full-length coherent.
+            banding = ""
+            if destriped is not None:
+                reductions.append(destriped.reduction_pct)
+                banding = (
+                    f"  ripple {destriped.ripple_before_pct:.2f}% -> "
+                    f"{destriped.ripple_after_pct:.2f}% ({destriped.reduction_pct:+.0f}%)"
+                )
+            console().print(
+                f"[dim]{index:>4}/{len(masters)}[/dim] {block_id:<5} "
+                f"{preview.width}x{preview.height}  {preview.bytes_written / 1024:.0f} KB{banding}"
             )
-        except PreviewError as error:
-            # One unreadable master costs its own preview, not the other 78. That block still
-            # has its master and its manifest; only the picture is missing.
-            error_console().print(f"[yellow]{block_id}: {error}[/yellow]")
-            continue
-        written += preview.bytes_written
-        rendered.append((block_id, image))
-        # Reported per block rather than only in aggregate: a block whose banding barely moved
-        # is worth seeing, because it means the ripple there was not full-length coherent.
-        banding = ""
-        if destriped is not None:
-            reductions.append(destriped.reduction_pct)
-            banding = (
-                f"  ripple {destriped.ripple_before_pct:.2f}% -> "
-                f"{destriped.ripple_after_pct:.2f}% ({destriped.reduction_pct:+.0f}%)"
-            )
-        console().print(
-            f"[dim]{index:>4}/{len(masters)}[/dim] {block_id:<5} "
-            f"{preview.width}x{preview.height}  {preview.bytes_written / 1024:.0f} KB{banding}"
-        )
+            advance(1)
 
     console().print(
         f"previews: {len(rendered)} files, {written / 1024 / 1024:.1f} MB in {directory}"
@@ -1196,28 +1422,31 @@ def _build_project_overview(
     # off by one in a way that labels every line "runs".
     block_of = {path: block_id for block_id, path in masters}
 
-    def show(index: int, total: int, master: Path, result: Any) -> None:
-        detail = ""
-        if result is not None:
-            detail = (
-                f"  ripple {result.ripple_before_pct:.2f}% -> "
-                f"{result.ripple_after_pct:.2f}% ({result.reduction_pct:+.0f}%)"
-            )
-        console().print(
-            f"[dim]{index:>4}/{total}[/dim] {block_of.get(master, master.stem):<5}{detail}"
-        )
+    with _progress("overview", len(masters), unit="blocks") as advance:
 
-    try:
-        built = build_overview(
-            [path for _, path in masters],
-            workspace.derived_dir(project_id) / f"{slug}_overview.tif",
-            gsd=gsd,
-            apply_destripe=apply_destripe,
-            progress=show,
-        )
-    except PreviewError as error:
-        error_console().print(f"[bold red]FAILED[/bold red] {error}")
-        raise typer.Exit(EXIT_FAIL) from error
+        def show(index: int, total: int, master: Path, result: Any) -> None:
+            detail = ""
+            if result is not None:
+                detail = (
+                    f"  ripple {result.ripple_before_pct:.2f}% -> "
+                    f"{result.ripple_after_pct:.2f}% ({result.reduction_pct:+.0f}%)"
+                )
+            console().print(
+                f"[dim]{index:>4}/{total}[/dim] {block_of.get(master, master.stem):<5}{detail}"
+            )
+            advance(1)
+
+        try:
+            built = build_overview(
+                [path for _, path in masters],
+                workspace.derived_dir(project_id) / f"{slug}_overview.tif",
+                gsd=gsd,
+                apply_destripe=apply_destripe,
+                progress=show,
+            )
+        except PreviewError as error:
+            error_console().print(f"[bold red]FAILED[/bold red] {error}")
+            raise typer.Exit(EXIT_FAIL) from error
 
     console().print(
         f"\noverview: {built.width:,} x {built.height:,} px at {built.gsd:g} m  "
@@ -1305,10 +1534,11 @@ def radiometry(
         ),
     ] = False,
 ) -> None:
-    """Measure how much overlapping blocks disagree radiometrically.
+    """Measure how much overlapping blocks disagree radiometrically, and grade each pair.
 
-    Reports numbers only. No pair is passed or failed, because no threshold has been
-    established yet — that is a benchmark exercise, not a judgement call.
+    The grade needs `--linearise`: the thresholds are defined in linear light, and the same
+    percentage does not mean the same thing in encoded values. The exit code is the worst grade
+    any pair received.
     """
     settings = get_settings()
     workspace = Workspace(settings.workspace_root)
@@ -1353,6 +1583,7 @@ def radiometry(
         report,
     )
     _render_radiometry(report, path)
+    raise typer.Exit(_EXIT_FOR_STATUS.get(report.status, EXIT_PASS))
 
 
 @app.command()
@@ -1995,18 +2226,36 @@ def _render_radiometry(report: RadiometricOverlapReport, path: Path) -> None:
     detail.add_column("overlap", justify="right")
     for name in ("red", "green", "blue"):
         detail.add_column(name, justify="right")
+    detail.add_column("grade")
     for pair in worst:
+        colour = _STATUS_COLOUR.get(pair.status, "dim")
         detail.add_row(
             f"{pair.block_a}/{pair.block_b}",
             f"{pair.overlap_area_ha:.0f} ha",
             *(f"{b.relative_difference_pct:+.1f}%" for b in pair.bands),
+            f"[{colour}]{pair.status.value}[/{colour}]",
         )
     console().print(detail)
 
-    console().print(
-        f"{report.measured_count} of {report.pair_count} overlapping pairs measured. "
-        "No pair is passed or failed: thresholds are not established yet."
-    )
+    console().print(f"{report.measured_count} of {report.pair_count} overlapping pairs measured.")
+    counts = report.count_by_status()
+    if counts[GateStatus.NOT_EVALUATED] == len(measured):
+        console().print(
+            "[yellow]no pair graded[/yellow]: the thresholds are defined in linear light, so "
+            "re-measure with --linearise to have these judged"
+        )
+    else:
+        graded = " ".join(
+            f"[{_STATUS_COLOUR.get(status, 'dim')}]{status.value} {counts[status]}"
+            f"[/{_STATUS_COLOUR.get(status, 'dim')}]"
+            for status in (GateStatus.PASS, GateStatus.REVIEW, GateStatus.FAIL)
+            if counts[status]
+        )
+        console().print(
+            f"grades:  {graded}   "
+            f"[dim](review above {PAIR_REVIEW_PCT:g}%, fail above {PAIR_FAIL_PCT:g}% mean "
+            "disagreement in linear light)[/dim]"
+        )
     console().print(f"report: {path}")
 
 

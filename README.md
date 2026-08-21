@@ -30,9 +30,13 @@ Implemented and tested:
   packages each block once
 - derived viewing products: per-block previews, a labelled contact sheet, a destriped
   browsable overview, and a virtual mosaic with an optional external pyramid
+- radiometric pass thresholds, derived from the deliveries rather than chosen
+- `run-block`: raw imagery through ODM to a packaged master in one command, verified on a real
+  79-image DJI P1 flight strip against ODM 3.5.6
 
-Not implemented: a single command chaining submit through fetch. No block has yet been
-reconstructed end to end through ODM.
+Not yet done: a complete P1 block. A P1 folder holds one flight strip, and only one strip of
+the one local flight is held here, so the reconstruction proven end to end covers 0.4 ha rather
+than a whole block.
 
 `docs/milestone-1-plan.md` has the sequence; `docs/decisions-and-verification.md` records
 what has been verified and what is still open.
@@ -80,8 +84,9 @@ Copying is not required if the delivery is already on disk somewhere — pass
 costs no disk space.
 
 **One camera per project directory.** L-camera and P1 orthophotos must not share one, because
-a mosaic grid has to be the finest pixel size present and their resolutions differ 14-fold. The
-tool checks this from the file headers in about a second and refuses before packaging anything.
+a mosaic grid has to be the finest pixel size present, and the Terra-exported P1 orthophotos
+here are 1.81 mm against the L cameras' 25.4 mm. The tool checks this from the file headers in
+about a second, and also refuses two coordinate systems, before packaging anything.
 
 **4. Run it.**
 
@@ -192,6 +197,7 @@ repackage the whole delivery: on Buduunkhad that is an extra 96 minutes.
 | `process` | Submit a block to NodeODM; returns the task id |
 | `status` | Report a task's progress, optionally following it |
 | `fetch` | Download a finished task, package its orthophoto and run QA |
+| `run-block` | Reconstruct one block of raw imagery and package it, in one command |
 | `radiometry` | Measure how much overlapping blocks disagree |
 | `harmonise` | Solve one gain per block per band from those measurements |
 | `previews` | Render a small JPEG per master, plus a labelled contact sheet |
@@ -208,10 +214,19 @@ the JPGs, a `Timestamp.MRK` covering the whole flight, the PPK observables and a
 export:
 
 ```bash
-uv run drone-photo p1-geo "<flight folder>" --project-id "Buduunkhad P1"
-uv run drone-photo validate "<flight folder>"
-uv run drone-photo process "<flight folder>" --profile p1_35
+uv run drone-photo p1-geo "<flight folder>" --project-id "Buduunkhad P1"   # check first
+uv run drone-photo run-block "<flight folder>" --project-id "Buduunkhad P1" \
+    --block-id B084 --profile p1_35_master
 ```
+
+`run-block` validates, submits to ODM, follows the reconstruction with an ETA, downloads,
+packages to the master contract and runs QA — one command. Ctrl-C stops the watching, not the
+task: `drone-photo fetch <task id>` collects it afterwards.
+
+**A P1 folder is one flight strip, not a block.** Measured on the local flight: the folder holds
+79 exposures spanning 16 × 106 m, while its mark file covers the whole flight, 649 exposures
+over 103 × 109 m. Reconstructing one folder gives a correct master of that strip — 0.4 ha — and
+not the block. A whole block means submitting every folder of that flight together.
 
 `p1-geo` checks before the hours are spent: that every image matches an exposure in the mark
 file *and* agrees with that exposure's position, that the RTK flag is uniform, and that the
@@ -224,8 +239,13 @@ EXIF and mark positions agree to 3 mm, so whether DJI already applied it cannot 
 the delivery. `--apply-lever-arm` runs that experiment. `docs/decisions-and-verification.md`
 §2.16 has the measurements.
 
-No block has yet been reconstructed through ODM, so the P1 path beyond `p1-geo` and `validate`
-is untested against a running engine.
+**Verified against ODM 3.5.6** on that strip: the P1 is in ODM's sensor database (no
+unknown-camera warning, no calibration override needed), all 79 images entered the
+reconstruction, and the output packaged to a master that passed all fourteen contract checks.
+One thing the run exposed: ODM's default orthophoto resolution is 5 cm/px, which produced a
+5.0 cm master from imagery whose native GSD is 1.50 cm. The profiles now pin
+`orthophoto-resolution` low and let the engine clamp to what the imagery supports, because the
+master contract requires native resolution — see §2.21.
 
 ## The master contract
 

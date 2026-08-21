@@ -19,14 +19,16 @@ Method, and why it is built this way:
   vehicle should not move the answer, and with hundreds of pairs the outliers are certain
   to be there.
 
-No pass threshold is applied. Every pair is reported as NOT_EVALUATED until thresholds are
-derived from the benchmark cases, which is a measurement exercise rather than a judgement
-call — see docs/radiometry.md.
+Pairs measured in linear light are graded against thresholds derived from the deliveries
+themselves rather than chosen: see `PAIR_REVIEW_PCT` below and docs/radiometry.md. A pair
+measured in encoded values is still reported as NOT_EVALUATED, because the same percentage does
+not mean the same thing there.
 """
 
 from __future__ import annotations
 
 import itertools
+import statistics
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -40,6 +42,7 @@ from rasterio.enums import Resampling
 from rasterio.windows import from_bounds
 
 from ..colour import dn_to_linear
+from ..models.enums import GateStatus
 from ..models.qa import BandDifference, RadiometricOverlapReport, RadiometricPairResult
 
 BAND_NAMES = ("red", "green", "blue")
@@ -68,8 +71,54 @@ _ALPHA_VALID = 250
 _MIN_COMBINED_DN = 20.0
 
 
+# Thresholds on a pair's mean absolute band difference, measured in linear light.
+#
+# Derived from two independent directions that agree, not chosen for roundness:
+#
+# * **What an accepted delivery looks like.** On the corrected Buduunkhad masters -- 79 blocks
+#   that passed the raster contract and were delivered -- 79% of 231 pairs sit below 15% and
+#   97% below 30%. A gate at 15/30 leaves the bulk of a delivery alone and isolates a tail of
+#   8 pairs whose disagreement is a coherent all-band level difference over 50-107 ha of
+#   shared ground, which is a real inconsistency rather than sampling noise.
+# * **What a viewer can see.** Deliveries are display-referred, so a difference in light is
+#   compressed on screen: at mid grey, 15% in light is 6.7% on screen and 30% is 12.8%. Those
+#   bracket the range where a seam stops being invisible and becomes obvious.
+#
+# The floor for comparison is about 0.3%: the best-overlapping pairs here reach 0.24-0.6%, so
+# the measurement is capable of far finer discrimination than these thresholds ask for. What
+# they gate is agreement between blocks, not the precision of the measurement.
+PAIR_REVIEW_PCT = 15.0
+PAIR_FAIL_PCT = 30.0
+
+
 class RadiometryError(RuntimeError):
     pass
+
+
+def judge_pair(mean_abs_pct: float, *, linearised: bool) -> tuple[GateStatus, str]:
+    """Grade one pair's disagreement, or decline to.
+
+    Only linearised measurements are judged. The same percentage means different things in the
+    two spaces -- the identical Buduunkhad imagery measures a 7.3% median disagreement in
+    encoded values and 16.5% in linear light -- so one set of thresholds cannot serve both, and
+    inventing a second calibration for a space nothing is solved in would be worse than
+    declining.
+    """
+    if not linearised:
+        return (
+            GateStatus.NOT_EVALUATED,
+            "measured in encoded values; the thresholds are defined in linear light, so "
+            "re-measure with --linearise for this pair to be judged",
+        )
+    if mean_abs_pct <= PAIR_REVIEW_PCT:
+        return GateStatus.PASS, ""
+    on_screen = "visible" if mean_abs_pct <= PAIR_FAIL_PCT else "obvious"
+    status = GateStatus.REVIEW if mean_abs_pct <= PAIR_FAIL_PCT else GateStatus.FAIL
+    return (
+        status,
+        f"{mean_abs_pct:.1f}% mean disagreement in linear light, above the "
+        f"{PAIR_REVIEW_PCT:g}% threshold at which a seam becomes {on_screen}",
+    )
 
 
 @dataclass(frozen=True)
@@ -272,6 +321,10 @@ def compare_pair(
             )
         )
 
+    status, note = judge_pair(
+        statistics.fmean(abs(band.relative_difference_pct) for band in bands),
+        linearised=linearise,
+    )
     return RadiometricPairResult(
         block_a=a.block_id,
         block_b=b.block_id,
@@ -280,6 +333,8 @@ def compare_pair(
         sample_pixels=int(stacked_a.shape[1]),
         patch_metres=patch_metres,
         bands=bands,
+        status=status,
+        note=note,
     )
 
 
