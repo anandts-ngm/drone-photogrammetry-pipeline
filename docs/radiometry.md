@@ -52,6 +52,13 @@ The policy is declared in the profile (`radiometry.policy`, e.g. `analytical_mas
 the profile hash is recorded in every run manifest — so "which radiometric policy produced
 this file" is always answerable from the product itself.
 
+That answer is only worth having if the profile's settings actually reached the engine, and for
+a period they did not: the whole option body was being discarded in transit while the manifest
+recorded the profile hash regardless. Task creation now reads the options back from the engine
+and refuses a task whose settings did not arrive. See
+`docs/decisions-and-verification.md` §2.24 — the failure was invisible from the product, which
+is exactly why the check exists rather than the fix alone.
+
 ---
 
 ## 4. ODM options that alter radiometry

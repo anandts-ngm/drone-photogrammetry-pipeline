@@ -361,17 +361,11 @@ def _same_option(recorded: Any, sent: Any) -> bool:
     boolean can come back as the string "true" and a number as "8". Being strict here would
     reject working tasks, which is the opposite of the point.
     """
-    if isinstance(sent, bool) or isinstance(recorded, bool):
-        return (
-            str(recorded).lower() in {"true", "1"}
-            if sent
-            else str(recorded).lower()
-            in {
-                "false",
-                "0",
-            }
-        )
-    if isinstance(sent, int | float) and not isinstance(sent, bool):
+    if isinstance(sent, bool):
+        truthy = {"true", "1"} if sent else {"false", "0"}
+        return str(recorded).strip().lower() in truthy
+    # `bool` is an `int`, so the check above has already claimed it.
+    if isinstance(sent, int | float):
         try:
             return float(recorded) == float(sent)
         except (TypeError, ValueError):
