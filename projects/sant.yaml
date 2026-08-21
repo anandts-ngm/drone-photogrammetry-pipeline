@@ -1,0 +1,29 @@
+# Sant: 9 zones (N1-N9) of DJI Terra orthophotos, Nergui Undur licence area.
+#
+# Run it with:
+#   drone-photo process-project projects/sant.yaml
+#
+# EDIT `source_root` to wherever your copy of the delivery sits.
+
+project_id: Sant
+source_root: C:/MINING_PIPELINE_INPUTS/nergui_undur/sant/l_drone
+source_type: DJI_TERRA
+asset: dom.tif
+profile_id: external_terra
+
+# No declaration, deliberately. The files declare EPSG:32649 and no vertical CRS, and unlike
+# Buduunkhad this delivery came with no document stating a vertical datum. Declaring a guessed
+# one would turn "unknown" into a wrong answer that nothing downstream could question. The
+# masters are therefore not suitable for absolute-Z work until the drone team supplies it.
+declare_crs: null
+height_type: UNKNOWN
+sensor: null
+
+overview_gsd: 1.0
+preview_longest_side: 2048
+destripe_previews: true
+
+notes: >
+  22 further zones (N10-N31) exist on the delivery drive but not locally. Adding them is a
+  matter of copying them under source_root and rerunning: blocks that already have a master
+  are skipped unless --force is given.

@@ -44,6 +44,11 @@ BAND_COLOUR_INTERP = ("Red", "Green", "Blue", "Alpha")
 # expensive case is the full extent, around 1:256, and that is what the deep levels serve.
 FIRST_OVERVIEW_FACTOR = 8
 
+# Beyond this spread the finest block dictates a grid the rest cannot use. 4x tolerates the
+# 2.0x spread within the L-camera survey and the 1.1x within Sant, and refuses the 14x that
+# mixing P1 with an L camera produces.
+MAX_GSD_RATIO = 4.0
+
 # Stop once an overview is smaller than a window anyone would look at.
 _SMALLEST_OVERVIEW_PIXELS = 256
 
@@ -88,7 +93,9 @@ class Mosaic:
         return self.width * self.height / 1e9
 
 
-def read_sources(masters: list[Path]) -> list[MosaicSource]:
+def read_sources(
+    masters: list[Path], *, max_gsd_ratio: float = MAX_GSD_RATIO
+) -> list[MosaicSource]:
     """Describe every master, refusing anything that cannot share one grid."""
     if not masters:
         raise MosaicError("no masters given; a mosaic of nothing is not a product")
@@ -132,6 +139,24 @@ def read_sources(masters: list[Path]) -> list[MosaicSource]:
     bands = {s.band_count for s in found}
     if bands != {4}:
         raise MosaicError(f"expected 4-band RGBA masters, found band counts {sorted(bands)}")
+
+    # The grid is the finest pixel size present, so one much finer block sets the grid for
+    # everything. Mixing sensors is how that happens: P1 orthophotos here are 1.81 mm against
+    # the L cameras' 25.4 mm, and a combined mosaic would be 19,000 gigapixels rather than 97.
+    # Refuse rather than spend a day building something unopenable.
+    finest = min(s.pixel_size for s in found)
+    coarsest = max(s.pixel_size for s in found)
+    ratio = coarsest / finest if finest > 0 else float("inf")
+    if ratio > max_gsd_ratio:
+        fine = next(s for s in found if s.pixel_size == finest)
+        coarse = next(s for s in found if s.pixel_size == coarsest)
+        raise MosaicError(
+            f"pixel sizes span {ratio:.1f}x ({finest * 1000:.2f} mm in {fine.path.name} to "
+            f"{coarsest * 1000:.2f} mm in {coarse.path.name}), above the {max_gsd_ratio:.0f}x "
+            f"limit. A single grid at the finest size would be {ratio**2:.0f}x more pixels than "
+            "the coarsest blocks need. This usually means two sensors are in one project; give "
+            "each its own project id"
+        )
     return found
 
 
@@ -207,9 +232,11 @@ def add_overviews(mosaic: Path, factors: list[int]) -> list[int]:
             return [int(f) for f in ds.overviews(1)]
 
 
-def build_mosaic(masters: list[Path], destination: Path) -> Mosaic:
+def build_mosaic(
+    masters: list[Path], destination: Path, *, max_gsd_ratio: float = MAX_GSD_RATIO
+) -> Mosaic:
     """Write a VRT addressing every master on one grid."""
-    sources = read_sources(masters)
+    sources = read_sources(masters, max_gsd_ratio=max_gsd_ratio)
 
     grid_size = min(s.pixel_size for s in sources)
     left = min(s.left for s in sources)

@@ -19,6 +19,8 @@ measurement path and the processing path can use it without either importing the
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
 import numpy as np
 from numpy.typing import NDArray
 
@@ -30,8 +32,18 @@ _GAMMA = 2.4
 
 U8_MAX = 255.0
 
+if TYPE_CHECKING:
+    # Anything these functions can transfer: an array, a numpy scalar, or a Python number. Each
+    # goes through `np.asarray`, so the annotation states what the implementation accepts
+    # rather than the narrowest case a caller happens to pass.
+    #
+    # Type-checking only: numpy's runtime generics take fewer parameters than its type stubs,
+    # so evaluating this alias at import time raises. Annotations here are strings (PEP 563),
+    # so nothing does.
+    Values = NDArray[np.number[Any, Any]] | np.number[Any, Any] | float
 
-def srgb_to_linear(encoded: NDArray[np.floating] | float) -> NDArray[np.float32]:
+
+def srgb_to_linear(encoded: Values) -> NDArray[np.float32]:
     """Map display-referred values in [0, 1] to linear values in [0, 1]."""
     x = np.asarray(encoded, dtype=np.float32)
     return np.where(
@@ -39,7 +51,7 @@ def srgb_to_linear(encoded: NDArray[np.floating] | float) -> NDArray[np.float32]
     ).astype(np.float32)
 
 
-def linear_to_srgb(linear: NDArray[np.floating] | float) -> NDArray[np.float32]:
+def linear_to_srgb(linear: Values) -> NDArray[np.float32]:
     """Forward sRGB transfer function; the exact inverse of `srgb_to_linear`."""
     x = np.clip(np.asarray(linear, dtype=np.float32), 0.0, 1.0)
     return np.where(
@@ -49,7 +61,7 @@ def linear_to_srgb(linear: NDArray[np.floating] | float) -> NDArray[np.float32]:
     ).astype(np.float32)
 
 
-def dn_to_linear(dn: NDArray[np.number]) -> NDArray[np.float32]:
+def dn_to_linear(dn: Values) -> NDArray[np.float32]:
     """Linearise 8-bit DN, returning values on the same 0-255 scale.
 
     The scale is kept so that linearised numbers stay comparable in magnitude to the DN they
@@ -60,6 +72,6 @@ def dn_to_linear(dn: NDArray[np.number]) -> NDArray[np.float32]:
     return srgb_to_linear(np.asarray(dn, dtype=np.float32) / U8_MAX) * U8_MAX
 
 
-def linear_to_dn(linear: NDArray[np.floating]) -> NDArray[np.float32]:
+def linear_to_dn(linear: Values) -> NDArray[np.float32]:
     """Inverse of `dn_to_linear`, still on the 0-255 scale and not yet rounded."""
     return linear_to_srgb(np.asarray(linear, dtype=np.float32) / U8_MAX) * U8_MAX

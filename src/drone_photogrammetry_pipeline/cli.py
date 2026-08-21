@@ -6,6 +6,7 @@ result and the JSONL processing log written under the workspace, never this outp
 
 from __future__ import annotations
 
+import shutil
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -15,7 +16,7 @@ import typer
 from rich.table import Table
 
 from . import __version__
-from .config import get_settings
+from .config import Settings, get_settings
 from .derive.mosaic import MosaicError, add_overviews, build_mosaic, overview_factors
 from .derive.overview import DEFAULT_GSD, build_overview, write_overview_jpeg
 from .derive.preview import (
@@ -26,6 +27,16 @@ from .derive.preview import (
     write_preview,
 )
 from .harmonisation import HarmonisationError, solve_gain_offset, solve_gains
+from .ingest.p1_geo import (
+    GEO_FILENAME,
+    NADIR_TOLERANCE_DEG,
+    P1GeoError,
+    describe,
+    match_exposures,
+    read_mark_file,
+    read_metadata_csv,
+    write_geo_file,
+)
 from .ingest.scan import scan_block
 from .ingest.validate import validate_block
 from .log import configure, console, error_console
@@ -40,6 +51,7 @@ from .models.enums import (
 from .models.harmonisation import HarmonisationSolution
 from .models.manifest import BlockRunSummary, ProjectRunSummary
 from .models.profile import load_profile
+from .models.project import ProjectConfigError, load_project
 from .models.qa import RadiometricOverlapReport, RadiometricPairResult, RasterQAResult
 from .nodeodm.client import NodeODMClient, NodeODMError
 from .orchestration import (
@@ -92,6 +104,19 @@ _STATUS_COLOUR = {
 }
 
 _GIB = 1024**3
+
+# Measured over the Buduunkhad (92.3 -> 74.4 GiB, 96 min) and Sant (46.3 -> 33.4 GiB, 19 min)
+# deliveries. Used only for the estimate a caller sees before committing to a run.
+_MASTER_BYTES_PER_SOURCE_BYTE = 0.81
+_PACKAGING_SECONDS_PER_GIB = 62.0
+
+
+def _free_bytes(path: Path) -> int:
+    """Free space on the volume `path` will live on, whether or not it exists yet."""
+    for candidate in (path, *path.parents):
+        if candidate.exists():
+            return shutil.disk_usage(candidate).free
+    return 0
 
 
 class ExternalSource(StrEnum):
@@ -231,10 +256,139 @@ def validate(
     raise typer.Exit(EXIT_PASS)
 
 
+@app.command("p1-geo")
+def p1_geo(
+    root: Annotated[
+        Path,
+        typer.Argument(exists=True, file_okay=False, help="DJI P1 flight folder."),
+    ],
+    project_id: Annotated[str, typer.Option("--project-id", help="Project identifier.")],
+    block_id: Annotated[
+        str | None,
+        typer.Option("--block-id", help="Block identifier; defaults to the folder name."),
+    ] = None,
+    write_geo: Annotated[
+        bool,
+        typer.Option(
+            "--write-geo",
+            help=(
+                "Also write a geo.txt. Off by default: ODM already reads each image's RTK "
+                "standard deviations from its XMP, and a positions-only geo file replaces them "
+                "with ODM's 3 m default."
+            ),
+        ),
+    ] = False,
+    apply_lever_arm: Annotated[
+        bool,
+        typer.Option(
+            "--apply-lever-arm",
+            help=(
+                "Add the mark file's antenna-to-camera offset to every position, and write the "
+                "geo.txt that carries it. UNVERIFIED: whether DJI has already applied it is "
+                "unsettled. See docs/decisions-and-verification.md section 2.16."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Check a P1 flight folder's geolocation, and optionally write an ODM geo.txt.
+
+    Reads the whole mark file, keeps only the images actually in the folder, and checks each
+    match against that image's EXIF position before reporting anything.
+    """
+    settings = get_settings()
+    workspace = Workspace(settings.workspace_root)
+    workspace.guard_source(root)
+
+    block = scan_block(root, block_id=block_id)
+    marks_files = [path for path in block.navigation if path.suffix.upper() == ".MRK"]
+    if not marks_files:
+        error_console().print(
+            f"no .MRK mark file in {root}. A P1 folder carries one per flight; without it there "
+            "is nothing here that the images' own EXIF does not already say"
+        )
+        raise typer.Exit(EXIT_FAIL)
+    if not block.images:
+        error_console().print(f"no images in {root}")
+        raise typer.Exit(EXIT_FAIL)
+
+    metadata = root / "metadata.csv"
+    try:
+        marks = read_mark_file(marks_files[0])
+        exif = read_metadata_csv(metadata) if metadata.is_file() else None
+        exposures = match_exposures(block.images, marks, exif)
+    except P1GeoError as error:
+        error_console().print(f"[bold red]FAILED[/bold red] {error}")
+        raise typer.Exit(EXIT_FAIL) from error
+
+    found = describe(exposures)
+    console().print(
+        f"[bold]{block.block_id}[/bold]  {len(block.images)} images, "
+        f"{len(marks)} exposures in {marks_files[0].name}"
+    )
+    console().print(f"matched:   {found.images}")
+    if exif is None:
+        console().print(
+            "[yellow]no metadata.csv[/yellow]: the filename-to-exposure match could not be "
+            "checked against EXIF, and the gimbal attitude is unknown"
+        )
+    else:
+        console().print(
+            f"nadir:     {found.nadir_within_tolerance}/{found.images} within "
+            f"{NADIR_TOLERANCE_DEG:g} degree of straight down"
+        )
+    console().print(f"rtk flags: {', '.join(found.flags)}")
+    console().print(
+        f"accuracy:  {found.horizontal_accuracy_m * 100:.1f} cm horizontal, "
+        f"{found.vertical_accuracy_m * 100:.1f} cm vertical (95th percentile). "
+        "ODM reads these per image from the XMP on its own"
+    )
+    if found.lever_arm.worth_reporting:
+        console().print(
+            f"lever arm: {found.lever_arm.median_horizontal_m:.3f} m horizontal, "
+            f"{found.lever_arm.median_up_m:+.3f} m up  "
+            + ("[green]applied[/green]" if apply_lever_arm else "[dim]not applied[/dim]")
+        )
+
+    if not (write_geo or apply_lever_arm):
+        console().print(
+            f"\nno geo.txt written: nothing here improves on the EXIF. Submit with\n"
+            f'  drone-photo process "{root}" --profile p1_35'
+        )
+        return
+
+    try:
+        written = write_geo_file(
+            exposures,
+            workspace.block_inputs_dir(project_id, block.block_id) / GEO_FILENAME,
+            apply_lever_arm=apply_lever_arm,
+            source=marks_files[0],
+        )
+    except P1GeoError as error:
+        error_console().print(f"[bold red]FAILED[/bold red] {error}")
+        raise typer.Exit(EXIT_FAIL) from error
+
+    console().print(f"geo:       {written.path}")
+    console().print(
+        f"\n[yellow]this file clears the per-image RTK weighting[/yellow]: set ODM's "
+        f"--gps-accuracy to {found.horizontal_accuracy_m:.3f} in the profile, or it will use "
+        f"its 3 m default.\nSubmit with\n"
+        f'  drone-photo process "{root}" --profile p1_35 --geo "{written.path}"'
+    )
+
+
 @app.command()
 def process(
     root: Annotated[Path, typer.Argument(exists=True, file_okay=False, help="Block directory.")],
     profile_id: Annotated[str, typer.Option("--profile", help="Processing profile id.")],
+    geo: Annotated[
+        Path | None,
+        typer.Option(
+            "--geo",
+            exists=True,
+            dir_okay=False,
+            help="A geo.txt to upload with the imagery, as written by 'p1-geo'.",
+        ),
+    ] = None,
     node_url: Annotated[
         str | None, typer.Option("--node", help="NodeODM base URL; defaults to settings.")
     ] = None,
@@ -253,7 +407,12 @@ def process(
             raise typer.Exit(EXIT_FAIL)
         node = client.info()
         try:
-            uuid = submit(validated, loaded.profile, client)
+            uuid = submit(
+                validated,
+                loaded.profile,
+                client,
+                extra_uploads=[geo] if geo is not None else [],
+            )
         except (OdmProcessingError, NodeODMError) as error:
             error_console().print(f"[bold red]FAILED[/bold red] {error}")
             raise typer.Exit(EXIT_FAIL) from error
@@ -433,6 +592,56 @@ def run_project(
             console().print(f"[yellow]uncorrected (not in solution): {' '.join(unsolved)}[/yellow]")
 
     console().print(f"[bold]{project_id}[/bold]: {len(blocks)} blocks from {root}")
+    summary = _package_blocks(
+        blocks,
+        settings=settings,
+        workspace=workspace,
+        root=root,
+        source_type=_SOURCE_TYPES[source],
+        project_id=project_id,
+        profile_id=profile_id,
+        allow_alpha_from_nodata=allow_alpha_from_nodata,
+        verify_pixels=verify_pixels,
+        declare_crs=declare_crs,
+        height_type=height_type,
+        sensor=sensor,
+        solution=solution,
+        force=force,
+    )
+    raise typer.Exit(_project_exit_code(summary))
+
+
+def _project_exit_code(summary: ProjectRunSummary) -> int:
+    if summary.failed:
+        return EXIT_FAIL
+    if summary.review:
+        return EXIT_REVIEW
+    return EXIT_PASS
+
+
+def _package_blocks(
+    blocks: list[tuple[str, Path]],
+    *,
+    settings: Settings,
+    workspace: Workspace,
+    root: Path,
+    source_type: SourceType,
+    project_id: str,
+    profile_id: str,
+    allow_alpha_from_nodata: bool,
+    verify_pixels: bool,
+    declare_crs: str | None,
+    height_type: HeightType,
+    sensor: SensorId | None,
+    solution: HarmonisationSolution | None,
+    force: bool,
+) -> ProjectRunSummary:
+    """Package every block and write the run summary.
+
+    Extracted so that `run-project` and `process-project` share one implementation rather than
+    two that drift. Returns the summary instead of exiting, because a caller that has further
+    stages to run must not be terminated by this one.
+    """
     started_at = datetime.now(UTC)
     outcomes: list[IngestOutcome] = []
 
@@ -440,7 +649,7 @@ def run_project(
         outcome = ingest_external_to_master(
             IngestRequest(
                 source_path=source_path,
-                source_type=_SOURCE_TYPES[source],
+                source_type=source_type,
                 project_id=project_id,
                 block_id=block_id,
                 profile_id=profile_id,
@@ -458,26 +667,192 @@ def run_project(
         outcomes.append(outcome)
         _render_block_line(index, len(blocks), outcome)
 
-    finished_at = datetime.now(UTC)
     summary = ProjectRunSummary(
         project_id=project_id,
         source_root=str(root),
         started_at=started_at,
-        finished_at=finished_at,
+        finished_at=datetime.now(UTC),
         blocks=[_block_summary(outcome) for outcome in outcomes],
     )
-    stamp = started_at.strftime("%Y%m%dT%H%M%SZ")
     summary_path = write_project_summary(
-        workspace.reports_dir(project_id, "runs") / f"run_project_{stamp}.json", summary
+        workspace.reports_dir(project_id, "runs") / f"run_project_{started_at:%Y%m%dT%H%M%SZ}.json",
+        summary,
+    )
+    _render_project_summary(summary, summary_path)
+    return summary
+
+
+def _render_previews(
+    workspace: Workspace,
+    project_id: str,
+    masters: list[tuple[str, Path]],
+    *,
+    longest_side: int = DEFAULT_LONGEST_SIDE,
+    quality: int = DEFAULT_QUALITY,
+    apply_destripe: bool = True,
+    contact_sheet: bool = True,
+) -> None:
+    """Render one preview per master, plus a contact sheet of the project.
+
+    Shared with `process-project` so both write the same files under the same names. A derived
+    product whose location depends on which command produced it is not much of a product.
+    """
+    directory = workspace.derived_dir(project_id) / "previews"
+    console().print(f"[bold]{project_id}[/bold]: rendering {len(masters)} previews")
+
+    rendered: list[tuple[str, Any]] = []
+    written = 0
+    reductions: list[float] = []
+    for index, (block_id, master) in enumerate(masters, start=1):
+        try:
+            preview, image, destriped = write_preview(
+                master,
+                directory / f"{block_id}_preview.jpg",
+                longest_side=longest_side,
+                quality=quality,
+                apply_destripe=apply_destripe,
+            )
+        except PreviewError as error:
+            # One unreadable master costs its own preview, not the other 78. That block still
+            # has its master and its manifest; only the picture is missing.
+            error_console().print(f"[yellow]{block_id}: {error}[/yellow]")
+            continue
+        written += preview.bytes_written
+        rendered.append((block_id, image))
+        # Reported per block rather than only in aggregate: a block whose banding barely moved
+        # is worth seeing, because it means the ripple there was not full-length coherent.
+        banding = ""
+        if destriped is not None:
+            reductions.append(destriped.reduction_pct)
+            banding = (
+                f"  ripple {destriped.ripple_before_pct:.2f}% -> "
+                f"{destriped.ripple_after_pct:.2f}% ({destriped.reduction_pct:+.0f}%)"
+            )
+        console().print(
+            f"[dim]{index:>4}/{len(masters)}[/dim] {block_id:<5} "
+            f"{preview.width}x{preview.height}  {preview.bytes_written / 1024:.0f} KB{banding}"
+        )
+
+    console().print(
+        f"previews: {len(rendered)} files, {written / 1024 / 1024:.1f} MB in {directory}"
+    )
+    if reductions:
+        console().print(
+            f"destriped: {len(reductions)} blocks, mean ripple reduction "
+            f"{sum(reductions) / len(reductions):.0f}%"
+        )
+
+    if contact_sheet and rendered:
+        sheet = write_contact_sheet(
+            rendered,
+            workspace.derived_dir(project_id)
+            / f"{Workspace.project_slug(project_id)}_contact_sheet.jpg",
+        )
+        console().print(
+            f"sheet:    {sheet.path} ({sheet.width}x{sheet.height}, "
+            f"{sheet.bytes_written / 1024 / 1024:.1f} MB)"
+        )
+
+
+def _build_project_overview(
+    workspace: Workspace,
+    project_id: str,
+    masters: list[tuple[str, Path]],
+    *,
+    gsd: float = DEFAULT_GSD,
+    apply_destripe: bool = True,
+    jpeg: bool = True,
+) -> None:
+    """Assemble one small browsable raster covering the whole project."""
+    slug = Workspace.project_slug(project_id)
+    console().print(
+        f"[bold]{project_id}[/bold]: assembling {len(masters)} blocks at {gsd:g} m"
+        + ("  (destriping)" if apply_destripe else "")
     )
 
-    _render_project_summary(summary, summary_path)
+    # Labelled from the block list rather than from the path: a master sits at
+    # <block>/runs/<run_id>/master/<file>.tif, and counting parents to reach the block id is
+    # off by one in a way that labels every line "runs".
+    block_of = {path: block_id for block_id, path in masters}
 
-    if summary.failed:
-        raise typer.Exit(EXIT_FAIL)
-    if summary.review:
-        raise typer.Exit(EXIT_REVIEW)
-    raise typer.Exit(EXIT_PASS)
+    def show(index: int, total: int, master: Path, result: Any) -> None:
+        detail = ""
+        if result is not None:
+            detail = (
+                f"  ripple {result.ripple_before_pct:.2f}% -> "
+                f"{result.ripple_after_pct:.2f}% ({result.reduction_pct:+.0f}%)"
+            )
+        console().print(
+            f"[dim]{index:>4}/{total}[/dim] {block_of.get(master, master.stem):<5}{detail}"
+        )
+
+    try:
+        built = build_overview(
+            [path for _, path in masters],
+            workspace.derived_dir(project_id) / f"{slug}_overview.tif",
+            gsd=gsd,
+            apply_destripe=apply_destripe,
+            progress=show,
+        )
+    except PreviewError as error:
+        error_console().print(f"[bold red]FAILED[/bold red] {error}")
+        raise typer.Exit(EXIT_FAIL) from error
+
+    console().print(
+        f"\noverview: {built.width:,} x {built.height:,} px at {built.gsd:g} m  "
+        f"{built.bytes_written / 1024 / 1024:.1f} MB"
+    )
+    if built.destriped:
+        console().print(
+            f"destriped {built.destriped}/{built.blocks} blocks, "
+            f"mean ripple reduction {built.mean_ripple_reduction_pct:.0f}%"
+        )
+    console().print(f"path:     {built.path}")
+
+    if jpeg:
+        flat = write_overview_jpeg(built.path, built.path.with_name(f"{slug}_overview.jpg"))
+        console().print(f"jpeg:     {flat}  {flat.stat().st_size / 1024 / 1024:.1f} MB")
+
+
+def _build_project_mosaic(
+    workspace: Workspace,
+    project_id: str,
+    masters: list[tuple[str, Path]],
+    *,
+    overviews: bool,
+) -> None:
+    """Write the virtual mosaic, and optionally its pyramid."""
+    destination = (
+        workspace.derived_dir(project_id) / f"{Workspace.project_slug(project_id)}_mosaic.vrt"
+    )
+    try:
+        built = build_mosaic([path for _, path in masters], destination)
+    except MosaicError as error:
+        error_console().print(f"[bold red]FAILED[/bold red] {error}")
+        raise typer.Exit(EXIT_FAIL) from error
+
+    console().print(
+        f"[bold]{project_id}[/bold]: {built.sources} masters -> "
+        f"{built.width:,} x {built.height:,} px ({built.gigapixels:.1f} Gpx) "
+        f"at {built.pixel_size * 100:.2f} cm"
+    )
+    console().print(f"crs:    {built.crs}")
+    console().print(f"mosaic: {built.path}")
+
+    if not overviews:
+        console().print(
+            "[yellow]no overviews[/yellow]: a viewer asked for the full extent must read every "
+            "pixel of every master, which in practice does not finish. Build them later with "
+            "'drone-photo mosaic', or browse the overview instead"
+        )
+        return
+
+    factors = overview_factors(built.width, built.height)
+    console().print(f"building overviews {factors} (one pass over the masters)...")
+    present = add_overviews(built.path, factors)
+    pyramid = built.path.with_suffix(built.path.suffix + ".ovr")
+    size = pyramid.stat().st_size / _GIB if pyramid.is_file() else 0.0
+    console().print(f"overviews: {present}   {pyramid.name}  {size:.2f} GiB")
 
 
 @app.command()
@@ -622,6 +997,217 @@ def harmonise(
     _render_harmonisation(solution, solution_path, csv_path)
 
 
+@app.command("process-project")
+def process_project(
+    config_path: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, help="Project configuration YAML."),
+    ],
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Report what would run, and what is already done."),
+    ] = False,
+    correct: Annotated[
+        bool,
+        typer.Option(
+            "--correct/--no-correct",
+            help="Measure overlaps, solve gains, and apply them while packaging.",
+        ),
+    ] = True,
+    derived: Annotated[
+        bool,
+        typer.Option("--derived/--no-derived", help="Build previews, overview and mosaic."),
+    ] = True,
+    overviews: Annotated[
+        bool,
+        typer.Option(
+            "--overviews/--no-overviews",
+            help="Build the mosaic pyramid. Reads every master once; hours on a large survey.",
+        ),
+    ] = False,
+    force: Annotated[
+        bool, typer.Option("--force", help="Repackage blocks that already have a completed run.")
+    ] = False,
+) -> None:
+    """Take a delivery from source orthophotos to finished products, in one command.
+
+    The order matters for time rather than correctness. Overlaps are measured on the *sources*
+    first, so the gains are known before any master is written and each block is packaged once.
+    Packaging first and correcting afterwards would repackage the whole delivery: on the
+    79-block Buduunkhad survey that is an extra 96 minutes.
+    """
+    settings = get_settings()
+    try:
+        project = load_project(config_path)
+    except ProjectConfigError as error:
+        error_console().print(f"[bold red]FAILED[/bold red] {error}")
+        raise typer.Exit(EXIT_FAIL) from error
+
+    if project.source_type is None:
+        error_console().print(
+            f"{project.project_id}: source_type is unset, so this is a raw-imagery project. "
+            "process-project ingests delivered orthophotos; use the ODM path for raw flights"
+        )
+        raise typer.Exit(EXIT_FAIL)
+
+    workspace = Workspace(settings.workspace_root)
+    blocks = discover_blocks(project.source_root, project.asset)
+    if not blocks:
+        error_console().print(f"no sub-directory of {project.source_root} contains {project.asset}")
+        raise typer.Exit(EXIT_FAIL)
+
+    source_bytes = sum(path.stat().st_size for _, path in blocks)
+    existing = len(workspace.find_masters(project.project_id))
+    stages = [
+        ("measure overlaps", correct),
+        ("solve gains", correct),
+        ("package masters", True),
+        ("previews + contact sheet", derived),
+        ("overview", derived),
+        ("mosaic", derived),
+        ("mosaic pyramid", derived and overviews),
+    ]
+
+    console().print(f"[bold]{project.project_id}[/bold]  {config_path}")
+    console().print(f"source:    {project.source_root}")
+    console().print(f"blocks:    {len(blocks)}   {source_bytes / _GIB:.1f} GiB")
+    console().print(f"workspace: {workspace.project_dir(project.project_id)}")
+    if project.declare_crs:
+        console().print(f"crs:       {project.declare_crs}  heights {project.height_type.value}")
+    else:
+        console().print(
+            "crs:       from the source headers; no vertical reference declared, so the "
+            "products are not suitable for absolute-Z work"
+        )
+    if existing:
+        console().print(
+            f"[dim]{existing} block(s) already have a master; unchanged sources are reused "
+            f"{'(overridden by --force)' if force else ''}[/dim]"
+        )
+    console().print("")
+    for name, enabled in stages:
+        console().print(f"  {'[green]run[/green] ' if enabled else '[dim]skip[/dim]'}  {name}")
+
+    # Measured over both surveys: packaging writes 0.81 GiB per GiB read, at about 62 s per GiB.
+    # Blocks that already have a master are skipped, so only the rest are estimated.
+    remaining = len(blocks) if force else max(0, len(blocks) - existing)
+    share = remaining / len(blocks)
+    estimate = source_bytes * share * _MASTER_BYTES_PER_SOURCE_BYTE
+    free = _free_bytes(workspace.root)
+    console().print(
+        f"\n[dim]estimate: {remaining} block(s) to package, about {estimate / _GIB:.0f} GiB "
+        f"written in about {source_bytes * share / _GIB * _PACKAGING_SECONDS_PER_GIB / 60:.0f} "
+        f"min. {free / _GIB:.0f} GiB free.[/dim]"
+    )
+    # Warned rather than refused: the estimate is a ratio measured elsewhere, and the caller
+    # knows things it does not. Running out of room 80 minutes in is the failure worth avoiding.
+    if free < estimate:
+        error_console().print(
+            f"[yellow]not enough room[/yellow]: {free / _GIB:.0f} GiB free on the workspace "
+            f"volume against an estimated {estimate / _GIB:.0f} GiB of masters"
+        )
+
+    if dry_run:
+        console().print("[dim]nothing was written.[/dim]")
+        raise typer.Exit(EXIT_PASS)
+
+    solution_path: Path | None = None
+    if correct:
+        console().print("\n[bold]measuring overlaps[/bold] (on the sources, before packaging)")
+
+        usable = 0
+
+        def measured(index: int, total: int, result: RadiometricPairResult) -> None:
+            # A heartbeat rather than a line per pair: this survey has 231 of them, and they
+            # would bury the per-block packaging lines a reader is waiting on. `radiometry`
+            # prints every pair for anyone who wants them.
+            nonlocal usable
+            if result.bands:
+                usable += 1
+            if index % 25 == 0 or index == total:
+                console().print(f"[dim]  {index:>4}/{total} pairs, {usable} usable[/dim]")
+
+        report = measure_project(
+            project.project_id,
+            blocks,
+            linearise=True,
+            progress=measured,
+        )
+        stamp = report.generated_at.strftime("%Y%m%dT%H%M%SZ")
+        report_path = write_radiometry_report(
+            workspace.reports_dir(project.project_id, "radiometry")
+            / f"radiometry_{stamp}_linear.json",
+            report,
+        )
+        console().print(f"  {report.measured_count} of {report.pair_count} pairs measured")
+
+        try:
+            solution = solve_gains(report)
+        except HarmonisationError as error:
+            error_console().print(f"[bold red]FAILED[/bold red] {error}")
+            raise typer.Exit(EXIT_FAIL) from error
+        name = f"harmonisation_{stamp}_{solution.model}_{solution.space.value}"
+        solutions = workspace.reports_dir(project.project_id, "harmonisation")
+        solution_path = write_harmonisation(solutions / f"{name}.json", solution)
+        write_harmonisation_gains_csv(solutions / f"{name}.csv", solution)
+        _render_harmonisation(solution, solution_path, solutions / f"{name}.csv")
+        console().print(f"[dim]measured from {report_path.name}[/dim]")
+
+    console().print("\n[bold]packaging masters[/bold]")
+    summary = _package_blocks(
+        blocks,
+        settings=settings,
+        workspace=workspace,
+        root=project.source_root,
+        source_type=project.source_type,
+        project_id=project.project_id,
+        profile_id=project.profile_id,
+        allow_alpha_from_nodata=project.allow_alpha_from_nodata,
+        # Verification asserts the pixels are unchanged, so it cannot coexist with a
+        # correction. Honoured rather than refused here: the config asks for both only because
+        # correcting is the default, and silently dropping the weaker guarantee is right.
+        verify_pixels=project.verify_pixels and solution_path is None,
+        declare_crs=project.declare_crs,
+        height_type=project.height_type,
+        sensor=project.sensor,
+        solution=read_harmonisation_solution(solution_path) if solution_path else None,
+        force=force,
+    )
+    if summary.failed:
+        error_console().print(
+            "\n[bold red]stopping[/bold red]: blocks failed to package, so the derived products "
+            "would describe an incomplete set"
+        )
+        raise typer.Exit(EXIT_FAIL)
+
+    if derived:
+        masters = workspace.find_masters(project.project_id)
+
+        console().print("\n[bold]previews[/bold]")
+        _render_previews(
+            workspace,
+            project.project_id,
+            masters,
+            longest_side=project.preview_longest_side,
+            apply_destripe=project.destripe_previews,
+        )
+
+        console().print("\n[bold]overview[/bold]")
+        _build_project_overview(
+            workspace,
+            project.project_id,
+            masters,
+            gsd=project.overview_gsd,
+            apply_destripe=project.destripe_previews,
+        )
+
+        console().print("\n[bold]mosaic[/bold]")
+        _build_project_mosaic(workspace, project.project_id, masters, overviews=overviews)
+
+    console().print(f"\n[bold]done[/bold]  {workspace.project_dir(project.project_id)}")
+    raise typer.Exit(_project_exit_code(summary))
+
+
 @app.command()
 def mosaic(
     project_id: Annotated[str, typer.Option("--project-id", help="Project identifier.")],
@@ -653,36 +1239,7 @@ def mosaic(
         )
         raise typer.Exit(EXIT_FAIL)
 
-    destination = (
-        workspace.derived_dir(project_id) / f"{Workspace.project_slug(project_id)}_mosaic.vrt"
-    )
-    try:
-        built = build_mosaic([path for _, path in masters], destination)
-    except MosaicError as error:
-        error_console().print(f"[bold red]FAILED[/bold red] {error}")
-        raise typer.Exit(EXIT_FAIL) from error
-
-    console().print(
-        f"[bold]{project_id}[/bold]: {built.sources} masters -> "
-        f"{built.width:,} x {built.height:,} px ({built.gigapixels:.1f} Gpx) "
-        f"at {built.pixel_size * 100:.2f} cm"
-    )
-    console().print(f"crs:    {built.crs}")
-    console().print(f"mosaic: {built.path}")
-
-    if not overviews:
-        console().print(
-            "[yellow]no overviews[/yellow]: a viewer asked for the full extent must read every "
-            "pixel of every master, which in practice does not finish"
-        )
-        return
-
-    factors = overview_factors(built.width, built.height)
-    console().print(f"building overviews {factors} (one pass over the masters)...")
-    present = add_overviews(built.path, factors)
-    pyramid = built.path.with_suffix(built.path.suffix + ".ovr")
-    size = pyramid.stat().st_size / _GIB if pyramid.is_file() else 0.0
-    console().print(f"overviews: {present}   {pyramid.name}  {size:.2f} GiB")
+    _build_project_mosaic(workspace, project_id, masters, overviews=overviews)
 
 
 @app.command()
@@ -722,59 +1279,15 @@ def previews(
         error_console().print(f"no masters for {project_id}; run 'drone-photo run-project' first")
         raise typer.Exit(EXIT_FAIL)
 
-    directory = workspace.derived_dir(project_id) / "previews"
-    console().print(f"[bold]{project_id}[/bold]: rendering {len(masters)} previews")
-
-    rendered: list[tuple[str, Any]] = []
-    written = 0
-    reductions: list[float] = []
-    for index, (block_id, master) in enumerate(masters, start=1):
-        try:
-            preview, image, destriped = write_preview(
-                master,
-                directory / f"{block_id}_preview.jpg",
-                longest_side=longest_side,
-                quality=quality,
-                apply_destripe=apply_destripe,
-            )
-        except PreviewError as error:
-            error_console().print(f"[yellow]{block_id}: {error}[/yellow]")
-            continue
-        written += preview.bytes_written
-        rendered.append((block_id, image))
-        # Reported per block rather than only in aggregate: a block whose banding barely moved
-        # is worth seeing, because it means the ripple there was not full-length coherent.
-        banding = ""
-        if destriped is not None:
-            reductions.append(destriped.reduction_pct)
-            banding = (
-                f"  ripple {destriped.ripple_before_pct:.2f}% -> "
-                f"{destriped.ripple_after_pct:.2f}% ({destriped.reduction_pct:+.0f}%)"
-            )
-        console().print(
-            f"[dim]{index:>4}/{len(masters)}[/dim] {block_id:<5} "
-            f"{preview.width}x{preview.height}  {preview.bytes_written / 1024:.0f} KB{banding}"
-        )
-
-    console().print(
-        f"previews: {len(rendered)} files, {written / 1024 / 1024:.1f} MB in {directory}"
+    _render_previews(
+        workspace,
+        project_id,
+        masters,
+        longest_side=longest_side,
+        quality=quality,
+        apply_destripe=apply_destripe,
+        contact_sheet=contact_sheet,
     )
-    if reductions:
-        console().print(
-            f"destriped: {len(reductions)} blocks, mean ripple reduction "
-            f"{sum(reductions) / len(reductions):.0f}%"
-        )
-
-    if contact_sheet and rendered:
-        sheet = write_contact_sheet(
-            rendered,
-            workspace.derived_dir(project_id)
-            / f"{Workspace.project_slug(project_id)}_contact_sheet.jpg",
-        )
-        console().print(
-            f"sheet:    {sheet.path} ({sheet.width}x{sheet.height}, "
-            f"{sheet.bytes_written / 1024 / 1024:.1f} MB)"
-        )
 
 
 @app.command()
@@ -803,53 +1316,9 @@ def overview(
         error_console().print(f"no masters for {project_id}; run 'drone-photo run-project' first")
         raise typer.Exit(EXIT_FAIL)
 
-    slug = Workspace.project_slug(project_id)
-    console().print(
-        f"[bold]{project_id}[/bold]: assembling {len(masters)} blocks at {gsd:g} m"
-        + ("  (destriping)" if apply_destripe else "")
+    _build_project_overview(
+        workspace, project_id, masters, gsd=gsd, apply_destripe=apply_destripe, jpeg=jpeg
     )
-
-    # A master sits at <block>/runs/<run_id>/master/<file>.tif, so the block is four levels
-    # up. Counting three lands on "runs" and labels every line identically.
-    block_of = {path: block_id for block_id, path in masters}
-
-    def show(index: int, total: int, master: Path, result: Any) -> None:
-        detail = ""
-        if result is not None:
-            detail = (
-                f"  ripple {result.ripple_before_pct:.2f}% -> "
-                f"{result.ripple_after_pct:.2f}% ({result.reduction_pct:+.0f}%)"
-            )
-        console().print(
-            f"[dim]{index:>4}/{total}[/dim] {block_of.get(master, master.stem):<5}{detail}"
-        )
-
-    try:
-        built = build_overview(
-            [path for _, path in masters],
-            workspace.derived_dir(project_id) / f"{slug}_overview.tif",
-            gsd=gsd,
-            apply_destripe=apply_destripe,
-            progress=show,
-        )
-    except PreviewError as error:
-        error_console().print(f"[bold red]FAILED[/bold red] {error}")
-        raise typer.Exit(EXIT_FAIL) from error
-
-    console().print(
-        f"\noverview: {built.width:,} x {built.height:,} px at {built.gsd:g} m  "
-        f"{built.bytes_written / 1024 / 1024:.1f} MB"
-    )
-    if built.destriped:
-        console().print(
-            f"destriped {built.destriped}/{built.blocks} blocks, "
-            f"mean ripple reduction {built.mean_ripple_reduction_pct:.0f}%"
-        )
-    console().print(f"path:     {built.path}")
-
-    if jpeg:
-        flat = write_overview_jpeg(built.path, built.path.with_name(f"{slug}_overview.jpg"))
-        console().print(f"jpeg:     {flat}  {flat.stat().st_size / 1024 / 1024:.1f} MB")
 
 
 @app.command()

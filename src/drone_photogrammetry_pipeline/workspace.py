@@ -87,9 +87,33 @@ class RunPaths:
             directory.mkdir(parents=True, exist_ok=True)
 
 
+class WorkspaceLocationError(RuntimeError):
+    """Raised when the workspace root is somewhere products must not be written."""
+
+
+def _enclosing_repository(path: Path) -> Path | None:
+    """The nearest ancestor holding a `.git`, or None."""
+    for candidate in (path, *path.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
 class Workspace:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, allow_repository: bool = False) -> None:
         self.root = root.expanduser().resolve()
+
+        # `DPP_WORKSPACE_ROOT` defaults to a relative `workspace`, so a fresh clone that skips
+        # copying .env writes every product inside the checkout. On this survey that is 108 GB
+        # of masters in a git working tree, discovered late and awkwardly. Refuse instead.
+        if not allow_repository:
+            repository = _enclosing_repository(self.root)
+            if repository is not None:
+                raise WorkspaceLocationError(
+                    f"workspace root {self.root} is inside the git repository at {repository}. "
+                    "Products belong outside the checkout: copy .env.example to .env and set "
+                    "DPP_WORKSPACE_ROOT to a path on a data volume"
+                )
 
     def run_paths(self, project_id: str, block_id: str, run_id: str) -> RunPaths:
         return RunPaths(self.root / self.project_slug(project_id) / block_id / "runs" / run_id)
@@ -138,6 +162,15 @@ class Workspace:
             if masters:
                 found.append((block_id, masters[-1]))
         return sorted(found, key=lambda item: natural_key(item[0]))
+
+    def block_inputs_dir(self, project_id: str, block_id: str) -> Path:
+        """Generated inputs for a block that are not tied to one run.
+
+        A `geo.txt` derived from a flight's mark file belongs here rather than beside the
+        imagery: it is generated data, and generated data never lands in a source tree. It sits
+        outside `runs/` because it is an input to every run of that block, not a product of one.
+        """
+        return self.root / self.project_slug(project_id) / block_id / "inputs"
 
     def promoted_master_dir(self, project_id: str, block_id: str) -> Path:
         return self.root / self.project_slug(project_id) / block_id / "master"

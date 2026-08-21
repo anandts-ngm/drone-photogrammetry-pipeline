@@ -79,6 +79,9 @@ ignore = [
 # compared against the upstream documentation without translating, and so a rename upstream
 # shows up as a mismatch rather than being silently absorbed.
 "src/drone_photogrammetry_pipeline/nodeodm/schemas.py" = ["N815"]
+# The MRK fixture is copied verbatim from a real DJI mark file, tabs and all. Rewrapping it to
+# fit a line limit would test a format that does not exist.
+"tests/unit/test_p1_geo.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"

@@ -157,6 +157,27 @@ def test_an_empty_project_is_an_error_not_an_empty_mosaic(tmp_path: Path) -> Non
         read_sources([])
 
 
+def test_two_sensors_in_one_project_are_refused(tmp_path: Path) -> None:
+    """The grid is the finest size present, so one much finer block sets it for everything.
+
+    P1 orthophotos here are 1.81 mm against the L cameras' 25.4 mm: a combined mosaic would be
+    19,000 gigapixels rather than 97, and would take a day to build something unopenable.
+    """
+    p1 = write_master(tmp_path / "p1.tif", pixel=0.00181)
+    lidar_rgb = write_master(tmp_path / "l2.tif", pixel=0.0254, origin_x=500_100.0)
+
+    with pytest.raises(MosaicError, match="give each its own project id"):
+        build_mosaic([p1, lidar_rgb], tmp_path / "m.vrt")
+
+
+def test_the_spread_within_one_survey_is_tolerated(tmp_path: Path) -> None:
+    """Buduunkhad runs 2.54 cm to 5.11 cm across 47 distinct values, and must still mosaic."""
+    fine = write_master(tmp_path / "fine.tif", pixel=0.0254)
+    coarse = write_master(tmp_path / "coarse.tif", pixel=0.0511, origin_x=500_100.0)
+
+    assert build_mosaic([fine, coarse], tmp_path / "m.vrt").sources == 2
+
+
 def test_the_mosaic_covers_the_union_of_its_sources(tmp_path: Path) -> None:
     a = write_master(tmp_path / "a.tif", origin_x=500_000.0, pixel=0.05, size=200)
     b = write_master(tmp_path / "b.tif", origin_x=500_015.0, pixel=0.05, size=200)

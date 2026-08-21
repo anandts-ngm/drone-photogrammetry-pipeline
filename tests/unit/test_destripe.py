@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from numpy.typing import NDArray
 
 from drone_photogrammetry_pipeline.colour import dn_to_linear, linear_to_dn
 from drone_photogrammetry_pipeline.derive.destripe import destripe
@@ -22,7 +23,9 @@ def scene(size: int = 512, value: int = 140) -> tuple[np.ndarray, np.ndarray]:
     return rgb, np.full((size, size), 255, dtype=np.uint8)
 
 
-def add_stripes(rgb: np.ndarray, *, axis: int, period: int = 64, amplitude: float = 0.06):
+def add_stripes(
+    rgb: np.ndarray, *, axis: int, period: int = 64, amplitude: float = 0.06
+) -> NDArray[np.uint8]:
     """Multiply alternating full-length bands, the way an exposure difference would."""
     size = rgb.shape[1 + axis]
     factor = 1.0 + amplitude * np.sign(np.sin(2 * np.pi * np.arange(size) / period))

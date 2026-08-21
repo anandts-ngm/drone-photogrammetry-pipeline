@@ -233,6 +233,101 @@ about **65%** of the time, which is why windows must be placed from a validity m
 Both figures come from the downstream `lithology-ml` repository, which had already reached the
 correct conclusion; the error here was advising otherwise without checking.
 
+### 2.13 One command per delivery, in the order that packages each block once — **DECIDED**
+
+Preparing the repository for coworkers who will clone it, drop a delivery in a folder and run
+it, the sequence a human would reach for is the wrong one. Building the masters first and
+correcting them afterwards means packaging the delivery twice: 96 minutes of it on Buduunkhad.
+Overlaps are measurable on the *sources*, so `process-project` measures, solves, and only then
+packages, with each block's gain already known.
+
+Three things went into `projects/*.yaml` rather than onto the command line:
+
+- `declare_crs` and `height_type` are a 48 m error one flag apart, and putting them in a file
+  makes them reviewable and diffable instead of retyped per stage and per rerun.
+- Unknown keys are refused. A mistyped `destripe_preview` that pydantic quietly drops reads as
+  configured while doing nothing.
+- A `+` compound CRS with `height_type: UNKNOWN` is refused. The declaration exists to remove
+  an ambiguity about which surface the heights are above; leaving the surface unstated puts it
+  straight back.
+
+`run-project` and `process-project` share one packaging implementation (`_package_blocks`),
+and the derived stages are shared with `previews`, `overview` and `mosaic` the same way. Two
+implementations of the same stage drift, and the drift shows up as products that differ
+depending on which command wrote them.
+
+### 2.14 A workspace inside the checkout is refused — **DECIDED**
+
+`DPP_WORKSPACE_ROOT` defaults to a relative `workspace`, so a clone that skips copying
+`.env.example` writes every product inside the git working tree. On this survey that is 75 GiB
+of masters in a repository. `Workspace.__init__` now walks the ancestors for a `.git` and
+refuses, naming the setting to change. `.env.example` was changed to a concrete off-repo path
+for the same reason: a default that only works if you notice it is not a default.
+
+### 2.15 The mosaic refuses a mixed-sensor project — **DECIDED: 4x GSD spread**
+
+A VRT has one geotransform, and the grid has to be the finest native pixel size present or
+detail the finest blocks really have is discarded. That makes one much finer block expensive
+for everything: P1 orthophotos here are 1.81 mm against the L cameras' 25.4 mm, so a combined
+mosaic would be 19,000 gigapixels rather than 97 — hours spent building something no viewer
+can open.
+
+`read_sources` therefore refuses a spread above 4x, which tolerates the 2.0x within the
+L-camera survey and the 1.1x within Sant. The error says what to do instead: give each sensor
+its own `project_id`. This is a refusal rather than an automatic regrid because resampling a
+survey to a common coarser grid is a decision about the product, not a detail of mosaicking.
+
+### 2.16 P1 geolocation: no `geo.txt` by default — **DECIDED**
+
+A P1 folder arrives as raw imagery plus a `Timestamp.MRK` event-mark file, and the obvious move
+is to turn the mark file into ODM's `geo.txt`. Reading ODM's own source says not to.
+
+**What ODM already does.** `opendm/photo.py` reads `@drone-dji:RtkStdLon`, `RtkStdLat` and
+`RtkStdHgt` from each image's XMP and sets that image's `gps_xy_stddev` to the larger of the
+two horizontal values and `gps_z_stddev` from the height. On the measured block those are
+1.3 cm to 2.3 cm, per image. `--gps-accuracy` (default **3 m**, not 10) is only the fallback
+for imagery that carries no such tags.
+
+**What a geo file would cost.** `GeoFile` parses
+`filename x y [z] [yaw pitch roll] [horiz_acc vert_acc]`, and `update_with_geo_entry` assigns
+`gps_xy_stddev = geo_entry.horizontal_accuracy` unconditionally. A four-column file therefore
+*clears* the per-image RTK weighting ODM had just read, dropping the block back to the 3 m
+default. Filling the accuracy columns is not available either: they sit behind the attitude
+columns, ODM takes yaw from `FlightYawDegree` (absent from the exiftool export the drone team
+produces) and on the EXIF path stores `90 + GimbalPitchDegree` for a DJI make while a geo entry
+is taken as given — so writing the raw gimbal pitch would hand the bundle adjustment a
+90-degree prior.
+
+So `p1-geo` **reports** and does not write unless asked. What it checks is worth having on its
+own:
+
+| Check | Measured on `DJI_202608031301_013_B084` |
+|---|---|
+| Images matched to an exposure | 79 of 79 |
+| Exposures in the mark file | 649 — one file per flight, one folder per block |
+| RTK flag | 52 for every exposure, uniform |
+| Position accuracy, 95th percentile | 2.2 cm horizontal, 2.3 cm vertical |
+| Gimbal within 1 degree of nadir | 79 of 79 |
+
+The image-to-exposure match is by the four-digit filename suffix and is **verified** against
+that image's EXIF position, refusing anything more than a metre apart. Without that check a
+wrong rule would georeference every image to a neighbour's position and nothing downstream
+would notice.
+
+**One question left open: the antenna-to-camera lever arm.** The mark file's `N/E/V` fields
+are 0.402 m, 0.591 m and 0.219 m on the first exposure. They are a body-frame vector expressed
+in local ENU, not a constant: measured across 649 exposures the offset's bearing holds a
+constant 33 degrees relative to the flight course while the course itself runs 88, 268 and 311
+degrees, and the magnitude stays at 0.71 m. So it reverses between opposite strips — a 1.4 m
+relative displacement between neighbouring flight lines, not a uniform shift that a bundle
+adjustment absorbs harmlessly.
+
+Whether DJI has already applied it cannot be settled from this data: the EXIF position and the
+mark position agree to 3 mm, so either both are the antenna phase centre or both are the camera.
+Settling it needs a check point, or the same block processed both ways and compared. Until then
+`p1-geo --apply-lever-arm` exists to run that experiment and is off by default, and this is the
+one case where writing a `geo.txt` is the point rather than a cost.
+
 ### 2.6 Deviations from the proposed repository tree
 
 Six small additions, each with a reason, listed in `milestone-1-plan.md` §2. Flagged here

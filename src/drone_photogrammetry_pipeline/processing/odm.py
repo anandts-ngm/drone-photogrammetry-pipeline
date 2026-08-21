@@ -17,6 +17,7 @@ module:
 from __future__ import annotations
 
 import zipfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -97,8 +98,14 @@ def submit(
     client: NodeODMClient,
     *,
     validate_options: bool = True,
+    extra_uploads: Sequence[Path] = (),
 ) -> str:
-    """Create a NodeODM task for a block. Returns the task uuid."""
+    """Create a NodeODM task for a block. Returns the task uuid.
+
+    `extra_uploads` carries files ODM detects by name that are not in the source folder — a
+    `geo.txt` this pipeline generated, for instance. They go to the engine as uploads because
+    the alternative is writing them next to the imagery, and a source tree stays as delivered.
+    """
     if not block.is_processable:
         reasons = "; ".join(f"{f.name}: {f.detail}" for f in block.fatal)
         raise OdmProcessingError(f"{block.block.block_id} did not pass validation — {reasons}")
@@ -113,8 +120,14 @@ def submit(
                 "engine does not have, because ODM ignores them silently"
             )
 
-    # Ground control travels with the imagery, not as an option.
-    uploads = [*block.block.images, *_control_uploads(block)]
+    # Ground control travels with the imagery, not as an option. A generated file wins over one
+    # of the same name in the source folder: it is the one this run can account for.
+    generated = {path.name for path in extra_uploads}
+    uploads = [
+        *block.block.images,
+        *(path for path in _control_uploads(block) if path.name not in generated),
+        *extra_uploads,
+    ]
     request = TaskRequest(
         name=block.block.block_id,
         images=uploads,

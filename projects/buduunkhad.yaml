@@ -1,0 +1,36 @@
+# Buduunkhad: 79 blocks of DJI Terra orthophotos from the L2/L3 RGB cameras (XV-023222).
+#
+# Run it with:
+#   drone-photo process-project projects/buduunkhad.yaml
+#
+# EDIT `source_root` to wherever your copy of the delivery sits. Everything below it is a
+# property of the delivery rather than of this machine, and should be left alone.
+
+project_id: Buduunkhad
+source_root: C:/MINING_PIPELINE_INPUTS/buduunkhad/buduunkhad
+source_type: DJI_TERRA
+asset: dom.tif
+profile_id: external_terra
+
+# From METADATA_Buduunkhad_XV-023222.txt, the only authoritative source for the vertical
+# reference: the delivered GeoTIFFs declare EPSG:32647 and carry no vertical CRS at all.
+# 5705 is Baltic 1977, whose heights are NORMAL -- not orthometric, not ellipsoidal.
+# The geoid was already applied in the field, so nothing here reprojects Z; the declaration
+# only records what the numbers already mean. Applying Mongolia Geoid 2012 again would move
+# every elevation by about 48 m.
+declare_crs: EPSG:32647+5705
+height_type: NORMAL
+
+# Left unset on purpose: the delivery mixes L2 and L3 RGB and an external product carries no
+# sensor identification, so stamping one across all 79 blocks would be a guess.
+sensor: null
+
+overview_gsd: 1.0
+preview_longest_side: 2048
+destripe_previews: true
+
+notes: >
+  Terra leaves flight-strip banding of about 5% in the masters. It is removed from the
+  previews and the overview and never from a master: no directional filter can tell a stripe
+  from real linear geology, and the previews are the one place where getting that wrong costs
+  nothing.

@@ -65,7 +65,42 @@ Metashape UI settings one-for-one.
   unknown, the fallback is `--cameras` with a calibration produced from a reference block.
 - **35 mm vs 50 mm.** Separate profiles from the start. Different GSD at the same altitude,
   different overlap behaviour, different feature-matching characteristics. Do not share.
-- **MRK / PPK.** Not milestone 1. The interface exists (§5); the conversion does not.
+- **MRK / PPK.** The mark file is now read — see below — but no PPK solution is computed here.
+
+### What a P1 folder actually contains, and what to do with it
+
+Measured on `E:\Buduunkhad P1 raw\DJI_202608031301_013_B084`:
+
+```text
+DJI_202608031301_013_B084/
+  DJI_20260803132556_0001.JPG ... _0080.JPG    79 images (0030 is absent)
+  DJI_202608031301_013_B084_Timestamp.MRK      649 exposures — the whole flight
+  DJI_202608031301_013_B084_PPKOBS.obs         raw observables
+  DJI_202608031301_013_B084_PPKNAV.nav
+  DJI_202608031301_013_B084_PPKRAW.bin
+  metadata.csv                                 exiftool export, 649 rows
+  exiftool.exe
+```
+
+Two things follow. The mark file and the exiftool export both cover the **flight**, while the
+folder holds one **block** of it, so anything read from them has to be filtered to the images
+actually present. And the positions are already RTK-fixed: every exposure reports flag 52 with
+standard deviations of 1.3–2.3 cm, which makes a PPK re-solve largely redundant for this
+delivery.
+
+```bash
+drone-photo p1-geo "<flight folder>" --project-id "Buduunkhad P1"   # check before submitting
+drone-photo validate "<flight folder>"
+drone-photo process "<flight folder>" --profile p1_35
+```
+
+`p1-geo` reports rather than writes, because ODM already reads each image's RTK standard
+deviations from its XMP and a positions-only `geo.txt` would replace them with ODM's 3 m
+default. It exists to catch, before hours of reconstruction, the things that are invisible
+afterwards: an image whose EXIF position does not match the exposure its filename points at, a
+non-uniform RTK flag, or a gimbal that was not pointing down. See
+`docs/decisions-and-verification.md` §2.16, including the unresolved antenna-to-camera lever
+arm and `--apply-lever-arm`, which is the experiment that would settle it.
 
 ---
 

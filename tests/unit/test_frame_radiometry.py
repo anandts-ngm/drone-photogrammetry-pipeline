@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from numpy.typing import NDArray
 
 from drone_photogrammetry_pipeline.processing.frame_radiometry import (
     FrameExposure,
@@ -72,8 +73,9 @@ def test_two_frames_of_the_same_scene_agree_after_normalisation() -> None:
     slow, fast = frame(1 / 500), frame(1 / 1600)
     ratio = fast.exposure_factor / slow.exposure_factor
 
-    def encode(lin: np.ndarray) -> np.ndarray:
-        return np.clip(linear_to_srgb(lin) * 255.0, 0, 255).astype(np.uint8)
+    def encode(lin: np.ndarray) -> NDArray[np.uint8]:
+        encoded: NDArray[np.uint8] = np.clip(linear_to_srgb(lin) * 255.0, 0, 255).astype(np.uint8)
+        return encoded
 
     reference = reference_exposure_factor([slow, fast])
     out_slow = normalise_frame(encode(scene), slow, reference)

@@ -26,6 +26,10 @@ Implemented and tested:
 - NodeODM client and ODM adapter, with the submit / status / fetch commands
 - radiometric overlap measurement, per-block gain solving, and application of a solved
   correction during packaging
+- `process-project`: one command per delivery, driven by a project file, in the order that
+  packages each block once
+- derived viewing products: per-block previews, a labelled contact sheet, a destriped
+  browsable overview, and a virtual mosaic with an optional external pyramid
 
 Not implemented: a single command chaining submit through fetch. No block has yet been
 reconstructed end to end through ODM.
@@ -37,10 +41,25 @@ what has been verified and what is still open.
 
 ```bash
 uv sync --all-groups
-cp .env.example .env          # then set DPP_WORKSPACE_ROOT
+cp .env.example .env          # then set DPP_WORKSPACE_ROOT to a path outside the checkout
 ```
 
-Package one externally produced orthophoto:
+Then point a project file at your copy of a delivery and run one command:
+
+```bash
+uv run drone-photo process-project projects/buduunkhad.yaml --dry-run   # what it would do
+uv run drone-photo process-project projects/buduunkhad.yaml
+```
+
+That measures the overlaps, solves one gain per block per band, packages every block to the
+master contract with that correction applied, then renders the previews, the contact sheet,
+the browsable overview and the virtual mosaic. On the 79-block Buduunkhad delivery it is
+about two hours and turns 92 GiB of sources into 74 GiB of masters.
+
+`--dry-run` writes nothing and reports which stages would run, how many blocks already have a
+master, and a size and time estimate.
+
+To package a single orthophoto instead:
 
 ```bash
 uv run drone-photo ingest-ortho ./BLK001_DOM.tif \
@@ -53,20 +72,84 @@ output and writes a manifest.
 Exit codes are `0` PASS, `1` FAIL, `2` REVIEW. REVIEW has its own code so a caller does not
 read "a human still has to look at this" as success.
 
+## The project file
+
+One YAML document per delivery, in `projects/`. Two of its fields cannot be inferred from the
+imagery and move every elevation if they are wrong, which is why they live in a reviewable
+file rather than on a command line:
+
+```yaml
+project_id: Buduunkhad
+source_root: C:/MINING_PIPELINE_INPUTS/buduunkhad/buduunkhad   # edit this
+source_type: DJI_TERRA
+asset: dom.tif
+
+declare_crs: EPSG:32647+5705   # adds a vertical reference the delivered files do not carry
+height_type: NORMAL            # which surface those heights are above
+```
+
+`declare_crs` is documented for Buduunkhad in `METADATA_Buduunkhad_XV-023222.txt`, which also
+records that the geoid was already applied in the field: reapplying it costs about 48 m. Sant
+came with no such document, so `projects/sant.yaml` declares nothing and its masters are not
+suitable for absolute-Z work until the drone team supplies one. A vertical component with no
+`height_type` is refused rather than guessed, and an unrecognised key is an error rather than
+a line that quietly does nothing.
+
+Stages can be skipped with `--no-correct`, `--no-derived` and `--force`. `--overviews` builds
+the mosaic pyramid, which reads every master once and takes hours on a large survey.
+
+Overlaps are measured on the **sources**, before anything is packaged, so each block is
+packaged once with its gain already known. Packaging first and correcting afterwards would
+repackage the whole delivery: on Buduunkhad that is an extra 96 minutes.
+
 ## Commands
 
 | Command | Purpose |
 |---|---|
+| `process-project` | A whole delivery from a project file: measure, solve, package, derive |
 | `validate` | Inventory a block and report what is present or missing |
 | `ingest-ortho` | Package one external orthophoto, with a manifest |
 | `run-project` | Package every block under a project directory |
 | `package` | Package one raster, without a manifest |
 | `qa` | Run master raster QA on a packaged orthophoto |
+| `p1-geo` | Check a DJI P1 flight folder's geolocation against its mark file |
 | `process` | Submit a block to NodeODM; returns the task id |
 | `status` | Report a task's progress, optionally following it |
 | `fetch` | Download a finished task, package its orthophoto and run QA |
 | `radiometry` | Measure how much overlapping blocks disagree |
 | `harmonise` | Solve one gain per block per band from those measurements |
+| `previews` | Render a small JPEG per master, plus a labelled contact sheet |
+| `overview` | Assemble one destriped, browsable image of a whole project |
+| `mosaic` | Write a virtual mosaic (`.vrt`) addressing every master |
+
+The last three are also run by `process-project`; they exist separately for rebuilding one
+derived product without touching the masters.
+
+## Raw P1 imagery
+
+A P1 delivery is not orthophotos, so `process-project` does not apply. A flight folder holds
+the JPGs, a `Timestamp.MRK` covering the whole flight, the PPK observables and an exiftool
+export:
+
+```bash
+uv run drone-photo p1-geo "<flight folder>" --project-id "Buduunkhad P1"
+uv run drone-photo validate "<flight folder>"
+uv run drone-photo process "<flight folder>" --profile p1_35
+```
+
+`p1-geo` checks before the hours are spent: that every image matches an exposure in the mark
+file *and* agrees with that exposure's position, that the RTK flag is uniform, and that the
+gimbal was pointing down. It reports rather than writing a `geo.txt`, because ODM already reads
+each image's RTK standard deviations from its XMP — 1.3 to 2.3 cm on the measured block — and a
+positions-only sidecar would replace them with ODM's 3 m default.
+
+The antenna-to-camera lever arm in the mark file, 0.71 m horizontally, is **not** applied: the
+EXIF and mark positions agree to 3 mm, so whether DJI already applied it cannot be told from
+the delivery. `--apply-lever-arm` runs that experiment. `docs/decisions-and-verification.md`
+§2.16 has the measurements.
+
+No block has yet been reconstructed through ODM, so the P1 path beyond `p1-geo` and `validate`
+is untested against a running engine.
 
 ## The master contract
 
@@ -88,7 +171,9 @@ Full specification and the QA checks that enforce it: `docs/raster-standard.md`.
 
 ## Outputs
 
-Products go outside the repository, at the path in `DPP_WORKSPACE_ROOT`. Directory names are
+Products go outside the repository, at the path in `DPP_WORKSPACE_ROOT`. A workspace inside
+the checkout is refused: the default is a relative `workspace/`, and a clone that skipped the
+`.env` step would otherwise put 75 GB of masters in a git working tree. Directory names are
 lower case with underscores.
 
 ```text
@@ -104,11 +189,27 @@ lower case with underscores.
       radiometry/     overlap measurements
       harmonisation/  solved coefficients
       runs/           per-project run summaries
+    derived/          built from finished masters, never measured from
+      previews/       one JPEG per block
+      <project>_contact_sheet.jpg
+      <project>_overview.tif / .jpg
+      <project>_mosaic.vrt
 ```
+
+`derived/` is kept apart because everything in it is resampled or lossy by design. A master
+and a picture of a master must never be confusable by location.
 
 A run is recognised as complete from its own manifest, matched on the source checksum, so a
 project can be interrupted and restarted, and a re-delivered file with an unchanged name is
 treated as new work.
+
+The virtual mosaic costs kilobytes: GDAL reads the masters on demand rather than copying them,
+and it opens in QGIS as one raster layer. Its grid is the finest native pixel size present, so
+a project mixing sensors is refused rather than built — P1 orthophotos here are 1.81 mm
+against the L cameras' 25.4 mm, which would be 19,000 gigapixels instead of 97. Give each
+sensor its own `project_id`. Without a pyramid (`--overviews`) a zoomed-out read of the mosaic
+has to touch every pixel of every master and in practice does not finish, which is what the
+single small overview raster is for.
 
 ## Radiometry
 
@@ -120,7 +221,8 @@ Buduunkhad delivery, in linear light, over 231 overlapping pairs:
 | as delivered | 19.9 % | 49.8 % | 125.3 % |
 | after per-block gain correction | 7.5 % | 23.6 % | 69.3 % |
 
-Measure, then solve, then apply:
+`process-project` does this in one pass. The three stages are also separate commands, for
+measuring a delivery without committing to packaging it:
 
 ```bash
 uv run drone-photo radiometry <blocks>/ --project-id buduunkhad --linearise
@@ -144,8 +246,12 @@ unchanged; a correction changes them.
   shape. Across the quantile range the ratio between two blocks drifts by a median of 25 %.
 - Gain-plus-offset fits the measurements better but is not used: the solved offsets drive
   shadow to pure black in 107 of 237 block-bands.
-- The delivered mosaics carry flight-strip striping of about 2.7 % of scene brightness,
-  present in 99 % of blocks. It comes from Terra's blending, not from this pipeline.
+- The delivered mosaics carry flight-strip striping, present in 99 % of blocks. Sampled across
+  whole blocks rather than along a single transect it is 4.9–5.7 % of scene brightness on
+  average and 17.6 % at worst. It comes from Terra's blending, not from this pipeline. It is
+  removed from the previews and the overview (78 % of the ripple, both surveys) and never from
+  a master: no directional filter can tell a stripe from real linear geology, and a preview is
+  the one place where getting that wrong costs nothing.
 - Block identity stays recoverable from corrected imagery at about 14.6 times chance.
   Correction reduces disagreement between blocks; it does not make them indistinguishable.
   A downstream train/test split must therefore be **geographic, cut along a coordinate axis
@@ -162,6 +268,7 @@ unchanged; a correction changes them.
 ```text
 docs/        architecture, sensor workflows, raster standard, radiometry, decisions
 profiles/    versioned per-sensor processing profiles; ODM options live only here
+projects/    one file per delivery: where its sources are, and what its CRS means
 src/         the package
 tests/       unit tests and generated raster fixtures
 examples/    example block.yaml documents
