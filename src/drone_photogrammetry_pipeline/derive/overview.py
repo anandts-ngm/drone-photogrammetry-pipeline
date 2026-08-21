@@ -85,11 +85,26 @@ def build_overview(
         raise PreviewError("no masters given; an overview of nothing is not a product")
 
     bounds = []
+    seen: dict[str, Path] = {}
     crs = None
     for master in masters:
         with rasterio.open(master) as ds:
             bounds.append(ds.bounds)
             crs = crs or ds.crs
+            seen.setdefault(str(ds.crs), master)
+
+    # Refused here rather than left to the caller. Taking the first block's CRS and pooling
+    # everything else's bounds into it places a zone-49 block by its raw easting on a zone-47
+    # grid: hundreds of kilometres out, and the result is a picture rather than an error, so
+    # nothing downstream would question it.
+    if len(seen) > 1:
+        described = ", ".join(f"{name} ({path.name})" for name, path in sorted(seen.items()))
+        raise PreviewError(
+            f"masters declare {len(seen)} different coordinate reference systems: {described}. "
+            "An overview of two reference systems would place one of them by numbers that mean "
+            "something else; give each its own project id"
+        )
+
     left = min(b.left for b in bounds)
     right = max(b.right for b in bounds)
     bottom = min(b.bottom for b in bounds)

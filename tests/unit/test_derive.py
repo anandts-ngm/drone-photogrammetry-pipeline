@@ -23,6 +23,7 @@ from drone_photogrammetry_pipeline.derive.mosaic import (
     overview_factors,
     read_sources,
 )
+from drone_photogrammetry_pipeline.derive.overview import build_overview
 from drone_photogrammetry_pipeline.derive.preview import (
     PreviewError,
     composite_on_white,
@@ -150,6 +151,20 @@ def test_mixed_reference_systems_are_refused(tmp_path: Path) -> None:
 
     with pytest.raises(MosaicError, match="coordinate reference systems"):
         build_mosaic([a, b], tmp_path / "m.vrt")
+
+
+def test_an_overview_of_two_reference_systems_is_refused(tmp_path: Path) -> None:
+    """It used to take the first block's CRS and pool the rest of the bounds into it.
+
+    That places a zone-49 block by its raw easting on a zone-47 grid, hundreds of kilometres
+    from where it belongs, and the output is a picture rather than an error -- so nothing
+    downstream would question it.
+    """
+    a = write_master(tmp_path / "a.tif", crs="EPSG:32647")
+    b = write_master(tmp_path / "b.tif", crs="EPSG:32649", origin_x=500_010.0)
+
+    with pytest.raises(PreviewError, match="coordinate reference systems"):
+        build_overview([a, b], tmp_path / "overview.tif", gsd=0.5)
 
 
 def test_an_empty_project_is_an_error_not_an_empty_mosaic(tmp_path: Path) -> None:

@@ -47,6 +47,12 @@ PATCH_GRID = 32
 DEFAULT_PATCHES = 48
 DEFAULT_PATCH_METRES = 4.0
 
+# Below this, a pair's shared ground is too small to say anything about the two blocks: the
+# 4 m patches would not fit, and a handful of pixels along a seam measures the seam rather than
+# the blocks. Named here rather than repeated as a literal, because a caller that reports "no
+# overlaps were found" has to be able to say what it was looking for.
+DEFAULT_MIN_OVERLAP_HA = 1.0
+
 # Percentile levels at which the two blocks' distributions are matched. Spread across the
 # range rather than clustered at the middle, because the question a single median cannot
 # answer is whether the blocks differ by a scale factor or by a black level, and only the
@@ -281,7 +287,7 @@ def measure_project(
     project_id: str,
     blocks: list[tuple[str, Path]],
     *,
-    min_overlap_ha: float = 1.0,
+    min_overlap_ha: float = DEFAULT_MIN_OVERLAP_HA,
     patches: int = DEFAULT_PATCHES,
     patch_metres: float = DEFAULT_PATCH_METRES,
     linearise: bool = False,

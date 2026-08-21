@@ -129,6 +129,54 @@ def test_two_cameras_in_one_folder_are_refused_before_any_packaging(tmp_path: Pa
     )
 
 
+def test_two_exploration_areas_in_one_folder_are_refused_before_any_packaging(
+    tmp_path: Path,
+) -> None:
+    """Two UTM zones cannot become one product, and nothing here reprojects.
+
+    Caught on the sources for the same reason as the resolution spread. Left to the mosaic it
+    was worse than late: both blocks were packaged and an overview was assembled that placed a
+    zone-49 block by its raw easting on a zone-47 grid, which produced a picture rather than
+    an error.
+    """
+    write_blocks(tmp_path / "inputs" / "buduunkhad", pixel_sizes={"B1": 0.02})
+    other = tmp_path / "inputs" / "buduunkhad" / "OTHER_AREA"
+    other.mkdir()
+    make_rasters.terra_dom_source(
+        other / "dom.tif",
+        crs="EPSG:32649",
+        transform=from_origin(500_000.5, 5_000_000.0, 0.02, 0.02),
+    )
+
+    result = run(config_at(tmp_path / "p.yaml"))
+
+    assert result.exit_code == EXIT_FAIL
+    assert "coordinate reference systems" in result.output
+    assert not list((tmp_path / "workspace").rglob("*_ORTHO_MASTER.tif"))
+    assert not list((tmp_path / "workspace").rglob("*_overview.tif"))
+
+
+def test_a_delivery_with_no_overlaps_says_how_to_process_it(tmp_path: Path) -> None:
+    """A gain comes from shared ground, so blocks that share none cannot be harmonised.
+
+    It stops rather than packaging uncorrected: the caller asked for a correction, and masters
+    that silently did not get one are indistinguishable afterwards from masters that did.
+    """
+    write_blocks(tmp_path / "inputs" / "buduunkhad", pixel_sizes={"Z1": 0.02, "Z2": 0.02})
+    # Move the second block far enough away that the two footprints do not touch.
+    make_rasters.terra_dom_source(
+        tmp_path / "inputs" / "buduunkhad" / "Z2" / "dom.tif",
+        transform=from_origin(500_100.0, 5_000_000.0, 0.02, 0.02),
+    )
+
+    result = run(config_at(tmp_path / "p.yaml"))
+
+    assert result.exit_code == EXIT_FAIL
+    assert "--no-correct" in result.output
+    assert "min-overlap-ha" in result.output
+    assert not list((tmp_path / "workspace").rglob("*_ORTHO_MASTER.tif"))
+
+
 def test_the_spread_within_one_survey_is_accepted(tmp_path: Path) -> None:
     """Buduunkhad runs 2.54 cm to 5.11 cm across 47 distinct values and must still process."""
     write_blocks(

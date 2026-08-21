@@ -74,7 +74,12 @@ from .packaging.correction import correction_for
 from .packaging.gdal_backend import PackagingError, PackagingPlan
 from .packaging.raster import package_master
 from .processing.odm import OdmProcessingError, retrieve, source_ortho, submit
-from .qa.radiometry import DEFAULT_PATCH_METRES, DEFAULT_PATCHES, measure_project
+from .qa.radiometry import (
+    DEFAULT_MIN_OVERLAP_HA,
+    DEFAULT_PATCH_METRES,
+    DEFAULT_PATCHES,
+    measure_project,
+)
 from .qa.raster import run_raster_qa
 from .reporting.manifest import (
     latest_radiometry_report,
@@ -120,14 +125,29 @@ _PACKAGING_SECONDS_PER_GIB = 62.0
 
 
 def _check_one_grid(sources: list[SourceShape]) -> None:
-    """Refuse a delivery whose resolutions cannot share one mosaic grid.
+    """Refuse a delivery whose blocks cannot share one grid, before anything is packaged.
 
-    Checked here, on the sources, rather than only when the mosaic is built: the limit is a
-    property of the delivery, and finding out about it after 96 minutes of packaging is finding
-    out too late. One folder holding two cameras' orthophotos is the way this happens.
+    Both checks belong on the sources rather than only on the finished masters: they are
+    properties of the delivery, and learning about them after 96 minutes of packaging is
+    learning too late. One folder holding two cameras' orthophotos, or two areas', is how it
+    happens.
     """
     if not sources:
         return
+
+    by_crs: dict[str, str] = {}
+    for source in sources:
+        by_crs.setdefault(str(source.crs), source.block_id)
+    if len(by_crs) > 1:
+        described = ", ".join(f"{crs} ({block})" for crs, block in sorted(by_crs.items()))
+        error_console().print(
+            f"\n[bold red]FAILED[/bold red] the sources declare {len(by_crs)} different "
+            f"coordinate reference systems: {described}.\nNothing here reprojects, so these "
+            "cannot become one product. This usually means two exploration areas are in one "
+            "folder; give each its own project id."
+        )
+        raise typer.Exit(EXIT_FAIL)
+
     finest = min(sources, key=lambda s: s.pixel_size)
     coarsest = max(sources, key=lambda s: s.pixel_size)
     ratio = coarsest.pixel_size / finest.pixel_size if finest.pixel_size > 0 else float("inf")
@@ -899,7 +919,7 @@ def radiometry(
     asset: Annotated[str, typer.Option("--asset")] = "dom.tif",
     min_overlap_ha: Annotated[
         float, typer.Option("--min-overlap-ha", help="Ignore pairs sharing less than this.")
-    ] = 1.0,
+    ] = DEFAULT_MIN_OVERLAP_HA,
     patches: Annotated[
         int, typer.Option("--patches", help="Ground patches sampled per pair.")
     ] = DEFAULT_PATCHES,
@@ -1207,6 +1227,18 @@ def process_project(
             solution = solve_gains(report)
         except HarmonisationError as error:
             error_console().print(f"[bold red]FAILED[/bold red] {error}")
+            # Stopping rather than quietly packaging uncorrected: the caller asked for a
+            # correction, and 79 masters that silently did not get one are indistinguishable
+            # afterwards from 79 that did.
+            if report.measured_count == 0:
+                error_console().print(
+                    "\nA gain is solved from the ground two blocks share, so a delivery whose "
+                    "blocks do not overlap cannot be harmonised. Either the blocks really are "
+                    "separate tiles -- in which case run with [bold]--no-correct[/bold] to "
+                    "package them as delivered -- or the overlaps are smaller than the "
+                    f"{DEFAULT_MIN_OVERLAP_HA:g} ha this looks for, which 'drone-photo "
+                    "radiometry --min-overlap-ha' can lower."
+                )
             raise typer.Exit(EXIT_FAIL) from error
         name = f"harmonisation_{stamp}_{solution.model}_{solution.space.value}"
         solutions = workspace.reports_dir(project.project_id, "harmonisation")
