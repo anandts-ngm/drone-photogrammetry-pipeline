@@ -8,9 +8,13 @@ boundaries and the reasons attached to them. The derivation is in `qa.radiometry
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
+from drone_photogrammetry_pipeline.cli import EXIT_FAIL, EXIT_PASS, app
+from drone_photogrammetry_pipeline.config import get_settings
 from drone_photogrammetry_pipeline.models.enums import GateStatus
 from drone_photogrammetry_pipeline.models.qa import (
     BandDifference,
@@ -22,6 +26,7 @@ from drone_photogrammetry_pipeline.qa.radiometry import (
     PAIR_REVIEW_PCT,
     judge_pair,
 )
+from tests.fixtures import make_rasters
 
 
 def pair(mean_pct: float, *, status: GateStatus, block_b: str = "B2") -> RadiometricPairResult:
@@ -133,6 +138,64 @@ def test_a_report_of_encoded_pairs_has_no_grade() -> None:
     unjudged = pair(50.0, status=GateStatus.NOT_EVALUATED)
 
     assert report(unjudged).status is GateStatus.NOT_EVALUATED
+
+
+def test_the_command_grades_a_real_pair_and_exits_with_the_grade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the CLI: two blocks 40% apart in light must fail, and say so.
+
+    The exit code is what a caller acts on, so it is asserted rather than the wording.
+    """
+    monkeypatch.setenv("DPP_WORKSPACE_ROOT", str(tmp_path / "workspace"))
+    monkeypatch.setenv("DPP_PROFILES_DIR", str(Path(__file__).resolve().parents[2] / "profiles"))
+    get_settings.cache_clear()
+
+    delivery = tmp_path / "delivery"
+    make_rasters.overlapping_pair(delivery, gain=1.4)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "radiometry",
+            str(delivery),
+            "--project-id",
+            "Buduunkhad",
+            "--linearise",
+            "--min-overlap-ha",
+            "0.001",
+        ],
+    )
+    get_settings.cache_clear()
+
+    # The wording is asserted on `judge_pair` above; rich wraps it at the console width, so
+    # here only the grade and the exit code are checked.
+    assert result.exit_code == EXIT_FAIL, result.output
+    assert "FAIL" in result.output
+    assert "grades:" in result.output
+
+
+def test_the_same_pair_is_not_graded_without_linearising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An encoded measurement is reported and left unjudged, and the run passes rather than
+    claiming a verdict it cannot support."""
+    monkeypatch.setenv("DPP_WORKSPACE_ROOT", str(tmp_path / "workspace"))
+    monkeypatch.setenv("DPP_PROFILES_DIR", str(Path(__file__).resolve().parents[2] / "profiles"))
+    get_settings.cache_clear()
+
+    delivery = tmp_path / "delivery"
+    make_rasters.overlapping_pair(delivery, gain=1.4)
+
+    result = CliRunner().invoke(
+        app,
+        ["radiometry", str(delivery), "--project-id", "Buduunkhad", "--min-overlap-ha", "0.001"],
+    )
+    get_settings.cache_clear()
+
+    assert result.exit_code == EXIT_PASS, result.output
+    assert "no pair graded" in result.output
+    assert "--linearise" in result.output
 
 
 def test_the_counts_cover_every_measured_pair() -> None:

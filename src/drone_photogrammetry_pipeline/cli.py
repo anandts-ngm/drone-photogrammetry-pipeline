@@ -1106,15 +1106,20 @@ def run_block(
         with _progress("reconstructing", 100.0, unit="percent") as advance:
             seen = 0.0
             last_stage = ""
+            last_tenth = -1
 
             def watch(info: Any) -> None:
-                nonlocal seen, last_stage
+                # Printed on a stage change and on every tenth of the way. The bar carries the
+                # detail when someone is watching, but ODM holds one status code for the whole
+                # reconstruction, so a redirected run would otherwise log one line an hour.
+                nonlocal seen, last_stage, last_tenth
                 advance(max(0.0, info.progress - seen))
                 seen = max(seen, info.progress)
                 stage = info.code.name if info.code else "UNKNOWN"
-                if stage != last_stage:
+                tenth = int(info.progress // 10)
+                if stage != last_stage or tenth != last_tenth:
                     console().print(f"[dim]  {info.progress:5.1f}%  {stage}[/dim]")
-                    last_stage = stage
+                    last_stage, last_tenth = stage, tenth
 
             try:
                 final = client.wait(uuid, poll_seconds=poll_seconds, on_progress=watch)
