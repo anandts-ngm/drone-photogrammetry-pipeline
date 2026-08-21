@@ -117,6 +117,10 @@ class Exposure:
     exif: ExifRecord | None
 
     @property
+    def has_attitude(self) -> bool:
+        return self.exif is not None and self.exif.gimbal_pitch is not None
+
+    @property
     def is_nadir(self) -> bool:
         """Whether the gimbal was pointing down, within a degree.
 
@@ -137,10 +141,12 @@ class BlockGeolocation:
     would let the bundle adjustment hold the worst positions more tightly than they deserve.
 
     `nadir_within_tolerance` counts images whose gimbal pitch was within a degree of straight
-    down. It is 0 when no `metadata.csv` was supplied, which is not the same as oblique.
+    down. It is counted separately from `with_attitude` because a block with no attitude at all
+    and a genuinely oblique block are different things that both report zero nadir images.
     """
 
     images: int
+    with_attitude: int
     nadir_within_tolerance: int
     horizontal_accuracy_m: float
     vertical_accuracy_m: float
@@ -149,7 +155,7 @@ class BlockGeolocation:
 
     @property
     def attitude_known(self) -> bool:
-        return self.nadir_within_tolerance > 0
+        return self.with_attitude > 0
 
 
 @dataclass(frozen=True)
@@ -393,6 +399,7 @@ def describe(exposures: list[Exposure]) -> BlockGeolocation:
         raise P1GeoError("no exposures to describe")
     return BlockGeolocation(
         images=len(exposures),
+        with_attitude=sum(1 for exposure in exposures if exposure.has_attitude),
         nadir_within_tolerance=sum(1 for exposure in exposures if exposure.is_nadir),
         horizontal_accuracy_m=_percentile(
             [exposure.mark.horizontal_accuracy for exposure in exposures], 0.95

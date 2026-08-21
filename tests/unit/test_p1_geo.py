@@ -231,6 +231,7 @@ def test_the_description_reports_what_a_caller_has_to_decide_with(tmp_path: Path
 
     assert found.images == 2
     assert found.flags == ("52",)
+    assert found.with_attitude == 2
     assert found.nadir_within_tolerance == 2, "a gimbal at -89.9 degrees is pointing down"
     assert found.horizontal_accuracy_m == pytest.approx(0.022, abs=0.001)
     assert found.vertical_accuracy_m == pytest.approx(0.0229, abs=0.001)
@@ -245,7 +246,11 @@ def test_without_an_exiftool_export_the_attitude_is_unknown_not_oblique(tmp_path
 
     assert found.images == 2
     assert not found.attitude_known
+    assert found.with_attitude == 0
     assert found.nadir_within_tolerance == 0
+    # The positions and their accuracies come from the mark file, so they survive the CSV's
+    # absence: only the attitude and the cross-check are lost with it.
+    assert found.horizontal_accuracy_m > 0.0
 
 
 def test_a_csv_without_gps_columns_is_refused(tmp_path: Path) -> None:
