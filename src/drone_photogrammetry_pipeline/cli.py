@@ -937,13 +937,24 @@ def process(
             help="A geo.txt to upload with the imagery, as written by 'p1-geo'.",
         ),
     ] = None,
+    max_concurrency: Annotated[
+        int | None,
+        typer.Option(
+            "--max-concurrency",
+            help=(
+                "Cap ODM's process count. Defaults to DPP_ODM_MAX_CONCURRENCY. ODM's own "
+                "default is the CPU count, which large imagery cannot afford."
+            ),
+        ),
+    ] = None,
     node_url: Annotated[
         str | None, typer.Option("--node", help="NodeODM base URL; defaults to settings.")
     ] = None,
 ) -> None:
     """Submit a block to NodeODM for reconstruction. Returns immediately with the task id."""
     settings = get_settings()
-    validated = validate_block(scan_block(root))
+    block = scan_block(root)
+    validated = validate_block(block)
     loaded = load_profile(settings.profiles_dir, profile_id)
 
     with NodeODMClient(node_url or settings.nodeodm_url) as client:
@@ -954,12 +965,22 @@ def process(
             )
             raise typer.Exit(EXIT_FAIL)
         node = client.info()
+
+        # The same advice as `run-block`: this command submits through the same path, so it
+        # inherits the same memory ceiling.
+        concurrency, advice = _concurrency_advice(
+            block.images, max_concurrency or settings.odm_max_concurrency
+        )
+        if advice:
+            error_console().print(advice)
+
         try:
             uuid = submit(
                 validated,
                 loaded.profile,
                 client,
                 extra_uploads=[geo] if geo is not None else [],
+                overrides=({"max-concurrency": concurrency} if concurrency is not None else None),
             )
         except (OdmProcessingError, NodeODMError) as error:
             error_console().print(f"[bold red]FAILED[/bold red] {error}")
