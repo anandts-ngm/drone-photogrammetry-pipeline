@@ -20,7 +20,12 @@ from .models.enums import GateStatus, HeightType, SensorId, SourceType, Workflow
 from .models.manifest import RunManifest
 from .models.profile import LoadedProfile, load_profile
 from .packaging.correction import BlockCorrection
-from .packaging.gdal_backend import PackagingError, PackagingPlan
+from .packaging.gdal_backend import (
+    PackagingError,
+    PackagingPlan,
+    RasterBackend,
+    RasterioGdalBackend,
+)
 from .packaging.raster import master_filename, package_master
 from .processing.external import ExternalIngestError, SourceOrtho, ingest_external_ortho
 from .qa.raster import run_raster_qa
@@ -87,6 +92,40 @@ def discover_blocks(root: Path, asset_name: str) -> list[tuple[str, Path]]:
     return sorted(found, key=lambda item: natural_key(item[0]))
 
 
+@dataclass(frozen=True)
+class SourceShape:
+    """One delivered orthophoto's grid, read from its header."""
+
+    block_id: str
+    path: Path
+    pixel_size: float
+    crs: str | None
+
+
+def describe_sources(
+    blocks: list[tuple[str, Path]], *, backend: RasterBackend | None = None
+) -> list[SourceShape]:
+    """Read every source's grid without reading a pixel.
+
+    Cheap enough to run before committing to a job -- 79 headers in about a second -- which is
+    the point: a delivery whose resolutions cannot share one grid should be refused before an
+    hour and a half of packaging, not after.
+    """
+    engine: RasterBackend = backend or RasterioGdalBackend()
+    shapes: list[SourceShape] = []
+    for block_id, path in blocks:
+        description = engine.describe(path)
+        shapes.append(
+            SourceShape(
+                block_id=block_id,
+                path=path,
+                pixel_size=abs(description.transform[0]),
+                crs=description.crs,
+            )
+        )
+    return shapes
+
+
 def find_completed_run(
     workspace: Workspace, project_id: str, block_id: str, source_sha256: str
 ) -> tuple[Path, RunManifest] | None:
@@ -95,7 +134,7 @@ def find_completed_run(
     Matched on the source checksum rather than on the path, so a re-delivered file with the
     same name is correctly treated as new work rather than skipped.
     """
-    runs = workspace.root / project_id / block_id / "runs"
+    runs = workspace.block_runs_dir(project_id, block_id)
     if not runs.is_dir():
         return None
     for run_dir in sorted(runs.iterdir(), reverse=True):

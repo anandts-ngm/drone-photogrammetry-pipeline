@@ -17,7 +17,13 @@ from rich.table import Table
 
 from . import __version__
 from .config import Settings, get_settings
-from .derive.mosaic import MosaicError, add_overviews, build_mosaic, overview_factors
+from .derive.mosaic import (
+    MAX_GSD_RATIO,
+    MosaicError,
+    add_overviews,
+    build_mosaic,
+    overview_factors,
+)
 from .derive.overview import DEFAULT_GSD, build_overview, write_overview_jpeg
 from .derive.preview import (
     DEFAULT_LONGEST_SIDE,
@@ -51,12 +57,14 @@ from .models.enums import (
 from .models.harmonisation import HarmonisationSolution
 from .models.manifest import BlockRunSummary, ProjectRunSummary
 from .models.profile import load_profile
-from .models.project import ProjectConfigError, load_project
+from .models.project import ProjectConfigError, load_project, resolve_source_root
 from .models.qa import RadiometricOverlapReport, RadiometricPairResult, RasterQAResult
 from .nodeodm.client import NodeODMClient, NodeODMError
 from .orchestration import (
     IngestOutcome,
     IngestRequest,
+    SourceShape,
+    describe_sources,
     discover_blocks,
     ingest_external_to_master,
     natural_key,
@@ -109,6 +117,32 @@ _GIB = 1024**3
 # deliveries. Used only for the estimate a caller sees before committing to a run.
 _MASTER_BYTES_PER_SOURCE_BYTE = 0.81
 _PACKAGING_SECONDS_PER_GIB = 62.0
+
+
+def _check_one_grid(sources: list[SourceShape]) -> None:
+    """Refuse a delivery whose resolutions cannot share one mosaic grid.
+
+    Checked here, on the sources, rather than only when the mosaic is built: the limit is a
+    property of the delivery, and finding out about it after 96 minutes of packaging is finding
+    out too late. One folder holding two cameras' orthophotos is the way this happens.
+    """
+    if not sources:
+        return
+    finest = min(sources, key=lambda s: s.pixel_size)
+    coarsest = max(sources, key=lambda s: s.pixel_size)
+    ratio = coarsest.pixel_size / finest.pixel_size if finest.pixel_size > 0 else float("inf")
+    if ratio <= MAX_GSD_RATIO:
+        return
+    error_console().print(
+        f"\n[bold red]FAILED[/bold red] the sources' pixel sizes span {ratio:.1f}x "
+        f"({finest.pixel_size * 100:.2f} cm in {finest.block_id} to "
+        f"{coarsest.pixel_size * 100:.2f} cm in {coarsest.block_id}), above the "
+        f"{MAX_GSD_RATIO:.0f}x limit.\nThis usually means one folder holds two cameras' "
+        "orthophotos. A single mosaic grid must be the finest size present, so a mixed folder "
+        f"would need {ratio**2:.0f}x more pixels than the coarser blocks have. Put each camera "
+        "in its own directory with its own project id."
+    )
+    raise typer.Exit(EXIT_FAIL)
 
 
 def _free_bytes(path: Path) -> int:
@@ -1003,6 +1037,18 @@ def process_project(
         Path,
         typer.Argument(exists=True, dir_okay=False, help="Project configuration YAML."),
     ],
+    source_root: Annotated[
+        Path | None,
+        typer.Option(
+            "--source-root",
+            exists=True,
+            file_okay=False,
+            help=(
+                "Directory holding this delivery's block directories. Defaults to the project "
+                "configuration's source_root, then to DPP_INPUTS_ROOT/<project>."
+            ),
+        ),
+    ] = None,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="Report what would run, and what is already done."),
@@ -1051,9 +1097,23 @@ def process_project(
         raise typer.Exit(EXIT_FAIL)
 
     workspace = Workspace(settings.workspace_root)
-    blocks = discover_blocks(project.source_root, project.asset)
+    try:
+        root = resolve_source_root(
+            project,
+            inputs_root=settings.inputs_root,
+            slug=Workspace.project_slug(project.project_id),
+            override=source_root,
+        )
+    except ProjectConfigError as error:
+        error_console().print(f"[bold red]FAILED[/bold red] {error}")
+        raise typer.Exit(EXIT_FAIL) from error
+
+    blocks = discover_blocks(root, project.asset)
     if not blocks:
-        error_console().print(f"no sub-directory of {project.source_root} contains {project.asset}")
+        error_console().print(
+            f"no sub-directory of {root} contains {project.asset}. Each block belongs in its own "
+            f"directory, named for the block, with the orthophoto inside it as {project.asset}"
+        )
         raise typer.Exit(EXIT_FAIL)
 
     source_bytes = sum(path.stat().st_size for _, path in blocks)
@@ -1069,7 +1129,7 @@ def process_project(
     ]
 
     console().print(f"[bold]{project.project_id}[/bold]  {config_path}")
-    console().print(f"source:    {project.source_root}")
+    console().print(f"source:    {root}")
     console().print(f"blocks:    {len(blocks)}   {source_bytes / _GIB:.1f} GiB")
     console().print(f"workspace: {workspace.project_dir(project.project_id)}")
     if project.declare_crs:
@@ -1087,6 +1147,8 @@ def process_project(
     console().print("")
     for name, enabled in stages:
         console().print(f"  {'[green]run[/green] ' if enabled else '[dim]skip[/dim]'}  {name}")
+
+    _check_one_grid(describe_sources(blocks))
 
     # Measured over both surveys: packaging writes 0.81 GiB per GiB read, at about 62 s per GiB.
     # Blocks that already have a master are skipped, so only the rest are estimated.
@@ -1158,7 +1220,7 @@ def process_project(
         blocks,
         settings=settings,
         workspace=workspace,
-        root=project.source_root,
+        root=root,
         source_type=project.source_type,
         project_id=project.project_id,
         profile_id=project.profile_id,

@@ -116,7 +116,18 @@ class Workspace:
                 )
 
     def run_paths(self, project_id: str, block_id: str, run_id: str) -> RunPaths:
-        return RunPaths(self.root / self.project_slug(project_id) / block_id / "runs" / run_id)
+        return RunPaths(self.block_runs_dir(project_id, block_id) / run_id)
+
+    def block_runs_dir(self, project_id: str, block_id: str) -> Path:
+        """Every run of one block.
+
+        A method rather than a path spelled out at each call site because it was spelled out
+        twice and the two disagreed: one applied `project_slug` and the other did not, so
+        looking for a completed run of project "Buduunkhad P1" searched a directory that
+        nothing writes to. On Windows the case difference happened to be invisible; a space or
+        a case-sensitive filesystem made every block repackage from scratch.
+        """
+        return self.project_dir(project_id) / block_id / "runs"
 
     @staticmethod
     def project_slug(project_id: str) -> str:

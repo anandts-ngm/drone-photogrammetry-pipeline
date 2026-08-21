@@ -15,6 +15,7 @@ from drone_photogrammetry_pipeline.models.project import (
     ProjectConfig,
     ProjectConfigError,
     load_project,
+    resolve_source_root,
 )
 
 BUDUUNKHAD = """
@@ -53,6 +54,7 @@ def test_a_relative_source_root_resolves_against_the_configuration_file(tmp_path
 
     config = load_project(path)
 
+    assert config.source_root is not None
     assert config.source_root.is_absolute()
     assert config.source_root == (tmp_path / "mining_pipeline_inputs" / "buduunkhad").resolve()
 
@@ -148,5 +150,78 @@ def test_the_configurations_shipped_with_the_repository_load(name: str) -> None:
     config = load_project(shipped)
 
     assert config.project_id
-    # `source_root` is the one machine-specific line, so it is not asserted to exist here.
     assert config.source_type is SourceType.DJI_TERRA
+    # No committed path: it would be one machine's drive letter in everybody's checkout.
+    assert config.source_root is None
+
+
+def test_sources_are_found_by_convention_when_nothing_says_otherwise(tmp_path: Path) -> None:
+    """The case a fresh clone is in: one setting in .env and no per-project edits."""
+    inputs = tmp_path / "drone_inputs"
+    (inputs / "buduunkhad").mkdir(parents=True)
+
+    found = resolve_source_root(
+        ProjectConfig(project_id="Buduunkhad"), inputs_root=inputs, slug="buduunkhad"
+    )
+
+    assert found == (inputs / "buduunkhad").resolve()
+
+
+def test_the_command_line_wins_over_the_configuration_and_the_convention(tmp_path: Path) -> None:
+    elsewhere = tmp_path / "delivery_on_a_usb_disk"
+    elsewhere.mkdir()
+    configured = tmp_path / "configured"
+    configured.mkdir()
+    (tmp_path / "inputs" / "sant").mkdir(parents=True)
+
+    found = resolve_source_root(
+        ProjectConfig(project_id="Sant", source_root=configured),
+        inputs_root=tmp_path / "inputs",
+        slug="sant",
+        override=elsewhere,
+    )
+
+    assert found == elsewhere.resolve()
+
+
+def test_the_configuration_wins_over_the_convention(tmp_path: Path) -> None:
+    configured = tmp_path / "configured"
+    configured.mkdir()
+    (tmp_path / "inputs" / "sant").mkdir(parents=True)
+
+    found = resolve_source_root(
+        ProjectConfig(project_id="Sant", source_root=configured),
+        inputs_root=tmp_path / "inputs",
+        slug="sant",
+    )
+
+    assert found == configured.resolve()
+
+
+def test_a_candidate_that_is_not_a_directory_falls_through_to_the_next(tmp_path: Path) -> None:
+    """A stale path in a configuration must not mask a delivery that is where it should be."""
+    (tmp_path / "inputs" / "sant").mkdir(parents=True)
+
+    found = resolve_source_root(
+        ProjectConfig(project_id="Sant", source_root=tmp_path / "moved_away"),
+        inputs_root=tmp_path / "inputs",
+        slug="sant",
+    )
+
+    assert found == (tmp_path / "inputs" / "sant").resolve()
+
+
+def test_when_nothing_is_found_the_error_lists_every_path_tried(tmp_path: Path) -> None:
+    """ "No such directory" without saying which ones were considered helps nobody."""
+    with pytest.raises(ProjectConfigError) as raised:
+        resolve_source_root(
+            ProjectConfig(project_id="Sant", source_root=tmp_path / "configured"),
+            inputs_root=tmp_path / "inputs",
+            slug="sant",
+            override=tmp_path / "passed_in",
+        )
+
+    message = str(raised.value)
+    assert "passed_in" in message
+    assert "configured" in message
+    assert str(Path("inputs") / "sant") in message

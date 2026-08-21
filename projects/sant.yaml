@@ -3,10 +3,10 @@
 # Run it with:
 #   drone-photo process-project projects/sant.yaml
 #
-# EDIT `source_root` to wherever your copy of the delivery sits.
+# The zones are looked for in <DPP_INPUTS_ROOT>/sant, which you set once in .env; pass
+# --source-root <dir> to read them from somewhere else instead.
 
 project_id: Sant
-source_root: C:/MINING_PIPELINE_INPUTS/nergui_undur/sant/l_drone
 source_type: DJI_TERRA
 asset: dom.tif
 profile_id: external_terra

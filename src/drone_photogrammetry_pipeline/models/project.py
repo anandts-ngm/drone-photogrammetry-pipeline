@@ -37,7 +37,12 @@ class ProjectConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     project_id: str
-    source_root: Path
+
+    # Optional, and normally absent. A delivery sits in a different place on every machine, so
+    # committing a path here would mean every reader editing a tracked file and every pull
+    # carrying someone else's drive letter. Left unset, the sources are found under
+    # `DPP_INPUTS_ROOT`; see `resolve_source_root`.
+    source_root: Path | None = None
 
     # Which external system produced the deliverables. Absent for a raw-imagery project, where
     # this pipeline is the producer rather than the consumer.
@@ -102,8 +107,57 @@ def load_project(path: Path) -> ProjectConfig:
 
     # Resolved relative to the configuration file, so a config and its delivery can be moved
     # together and a relative path keeps meaning what it said.
-    if not config.source_root.is_absolute():
+    if config.source_root is not None and not config.source_root.is_absolute():
         config = config.model_copy(
             update={"source_root": (path.parent / config.source_root).resolve()}
         )
     return config
+
+
+def resolve_source_root(
+    config: ProjectConfig,
+    *,
+    inputs_root: Path,
+    slug: str,
+    override: Path | None = None,
+) -> Path:
+    """Where this project's delivered blocks are, from the first source that names one.
+
+    Three ways to say it, in this order: `--source-root` on the command line, `source_root` in
+    the configuration, and the convention `<inputs_root>/<slug>`. The convention exists so that
+    a clone works with one setting in `.env` rather than an edit to every tracked project file;
+    the other two exist because a delivery that is already on disk somewhere should not have to
+    be moved or copied to be processed.
+
+    Reports every candidate it tried when none of them is a directory, because "no such
+    directory" without saying which three were considered is the least useful thing a tool can
+    say at this point.
+    """
+
+    # Resolved before use, not only before display: `DPP_INPUTS_ROOT` defaults to a relative
+    # `inputs`, and reporting "tried inputs/sant" tells a reader nothing about where to put
+    # the delivery.
+    def absolute(path: Path) -> Path:
+        return path.expanduser().resolve()
+
+    candidates: list[tuple[str, Path]] = []
+    if override is not None:
+        candidates.append(("--source-root", absolute(override)))
+    if config.source_root is not None:
+        candidates.append(
+            (
+                f"source_root in the configuration for {config.project_id}",
+                absolute(config.source_root),
+            )
+        )
+    candidates.append((f"DPP_INPUTS_ROOT/{slug}", absolute(inputs_root / slug)))
+
+    for _, candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+
+    tried = "\n".join(f"  {origin}: {candidate}" for origin, candidate in candidates)
+    raise ProjectConfigError(
+        f"no source directory for {config.project_id}. Tried, in order:\n{tried}\n"
+        "Put the delivery's block directories under the last one, or pass --source-root"
+    )

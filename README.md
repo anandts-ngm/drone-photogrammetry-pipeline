@@ -39,16 +39,52 @@ what has been verified and what is still open.
 
 ## Quick start
 
+**1. Install.** Needs [uv](https://docs.astral.sh/uv/) and Python 3.12; no GDAL install, no
+Docker, no GPU.
+
 ```bash
+git clone <this repo> && cd drone-photogrammetry-pipeline
 uv sync --all-groups
-cp .env.example .env          # then set DPP_WORKSPACE_ROOT to a path outside the checkout
+cp .env.example .env
 ```
 
-Then point a project file at your copy of a delivery and run one command:
+**2. Set two paths in `.env`.** Everything else has a working default.
+
+```ini
+DPP_INPUTS_ROOT=D:/drone_inputs             # where the deliveries are. Never written to.
+DPP_WORKSPACE_ROOT=D:/photogrammetry_outputs # where the products go. Must be outside the repo.
+```
+
+Put them on a volume with room: a 79-block survey reads 92 GB and writes about 75 GB.
+
+**3. Put the orthophotos where the tool looks for them** — one directory per project, one
+directory per block inside it, each holding its `dom.tif` exactly as Terra exported it:
+
+```text
+D:/drone_inputs/
+  buduunkhad/          <- matches project_id "Buduunkhad", lower case with underscores
+    B1/dom.tif
+    B2/dom.tif
+    ...  B79/dom.tif
+  sant/
+    N1/dom.tif
+    ...  N9/dom.tif
+```
+
+Copying is not required if the delivery is already on disk somewhere — pass
+`--source-root <dir>` instead, or on Windows point a junction at it
+(`New-Item -ItemType Junction -Path D:\drone_inputs\buduunkhad -Target <delivery>`), which
+costs no disk space.
+
+**One camera per project directory.** L-camera and P1 orthophotos must not share one, because
+a mosaic grid has to be the finest pixel size present and their resolutions differ 14-fold. The
+tool checks this from the file headers in about a second and refuses before packaging anything.
+
+**4. Run it.**
 
 ```bash
 uv run drone-photo process-project projects/buduunkhad.yaml --dry-run   # what it would do
-uv run drone-photo process-project projects/buduunkhad.yaml
+uv run drone-photo process-project projects/buduunkhad.yaml             # do it
 ```
 
 That measures the overlaps, solves one gain per block per band, packages every block to the
@@ -57,7 +93,24 @@ the browsable overview and the virtual mosaic. On the 79-block Buduunkhad delive
 about two hours and turns 92 GiB of sources into 74 GiB of masters.
 
 `--dry-run` writes nothing and reports which stages would run, how many blocks already have a
-master, and a size and time estimate.
+master, an output-size and time estimate, and how much room is free.
+
+**Interrupting it is safe.** Every block is recognised as complete from its own manifest,
+matched on the source file's checksum, so a rerun continues where it stopped and reprocesses
+only what changed. Ctrl-C, reboot, rerun.
+
+**5. Look at what came out.**
+
+| | |
+|---|---|
+| `<workspace>/<project>/<block>/runs/<run>/master/` | the corrected orthophoto, its manifest, its QA result |
+| `<workspace>/<project>/derived/<project>_overview.jpg` | the whole survey in one image — open this first |
+| `<workspace>/<project>/derived/<project>_contact_sheet.jpg` | every block on one page, labelled |
+| `<workspace>/<project>/derived/<project>_mosaic.vrt` | open in QGIS for full-resolution work |
+| `<workspace>/<project>/reports/` | what was measured, what was solved, what each run did |
+
+Exit code `0` means every block passed. `1` means at least one failed. `2` means at least one
+needs a human to look at it.
 
 To package a single orthophoto instead:
 
@@ -74,19 +127,24 @@ read "a human still has to look at this" as success.
 
 ## The project file
 
-One YAML document per delivery, in `projects/`. Two of its fields cannot be inferred from the
-imagery and move every elevation if they are wrong, which is why they live in a reviewable
-file rather than on a command line:
+One YAML document per delivery, in `projects/`, and it needs no editing: nothing in it is
+specific to one machine. Two of its fields cannot be inferred from the imagery and move every
+elevation if they are wrong, which is why they live in a reviewable file rather than on a
+command line:
 
 ```yaml
 project_id: Buduunkhad
-source_root: C:/MINING_PIPELINE_INPUTS/buduunkhad/buduunkhad   # edit this
 source_type: DJI_TERRA
 asset: dom.tif
 
 declare_crs: EPSG:32647+5705   # adds a vertical reference the delivered files do not carry
 height_type: NORMAL            # which surface those heights are above
 ```
+
+The sources are looked for in `<DPP_INPUTS_ROOT>/<project_id lower-cased>`, then overridden by
+`source_root` in the file if it is set, then by `--source-root` on the command line. When none
+of them exists the error names all three, so there is nothing to guess about where a delivery
+should have been.
 
 `declare_crs` is documented for Buduunkhad in `METADATA_Buduunkhad_XV-023222.txt`, which also
 records that the geoid was already applied in the field: reapplying it costs about 48 m. Sant

@@ -17,6 +17,12 @@ class Settings(BaseSettings):
     )
 
     workspace_root: Path = Path("workspace")
+
+    # Where the deliveries to process are kept. A project takes its sources from
+    # `<inputs_root>/<project slug>` unless its own configuration or `--source-root` says
+    # otherwise, so a fresh clone needs one path set rather than one per project.
+    inputs_root: Path = Path("inputs")
+
     profiles_dir: Path = Path("profiles")
     nodeodm_url: str = "http://localhost:3000"
     log_level: str = "INFO"

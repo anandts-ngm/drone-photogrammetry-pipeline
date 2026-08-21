@@ -3,11 +3,11 @@
 # Run it with:
 #   drone-photo process-project projects/buduunkhad.yaml
 #
-# EDIT `source_root` to wherever your copy of the delivery sits. Everything below it is a
-# property of the delivery rather than of this machine, and should be left alone.
+# Nothing in this file is specific to one machine, so it needs no editing. The blocks are
+# looked for in <DPP_INPUTS_ROOT>/buduunkhad, which you set once in .env; pass
+# --source-root <dir> to read them from somewhere else instead.
 
 project_id: Buduunkhad
-source_root: C:/MINING_PIPELINE_INPUTS/buduunkhad/buduunkhad
 source_type: DJI_TERRA
 asset: dom.tif
 profile_id: external_terra
