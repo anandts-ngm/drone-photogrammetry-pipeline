@@ -7,14 +7,29 @@ tested, whereas one enforced by every call site remembering it cannot.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+_TRAILING_NUMBER = re.compile(r"(\d+)$")
+
 
 class SourceProtectionError(RuntimeError):
     """Raised when an operation would write generated data into a source location."""
+
+
+def natural_key(name: str) -> tuple[str, int]:
+    """Sort B9 before B10, which a plain string sort would not.
+
+    Lives here rather than in orchestration because the workspace enumerates blocks too, and
+    two block orderings that disagree would be worse than one in an awkward place.
+    """
+    match = _TRAILING_NUMBER.search(name)
+    if match is None:
+        return (name, 0)
+    return (name[: match.start()], int(match.group(1)))
 
 
 def make_run_id(block_id: str, *, now: datetime | None = None) -> str:
@@ -101,6 +116,28 @@ class Workspace:
         radiometry report a given harmonisation came from.
         """
         return self.project_dir(project_id) / "reports" / kind
+
+    def derived_dir(self, project_id: str) -> Path:
+        """Products built from finished masters: mosaics, previews.
+
+        Kept in its own directory because these are lossy or resampled by design. A master and
+        a preview of a master must never be confusable by location.
+        """
+        return self.project_dir(project_id) / "derived"
+
+    def find_masters(self, project_id: str) -> list[tuple[str, Path]]:
+        """The current master for every block in a project, newest run per block.
+
+        Newest rather than all, because a block reprocessed after a source change has more
+        than one, and a mosaic containing two versions of the same ground is not a mosaic.
+        """
+        found: list[tuple[str, Path]] = []
+        for block_dir in sorted(self.project_dir(project_id).glob("*/runs")):
+            block_id = block_dir.parent.name
+            masters = sorted(block_dir.glob("*/master/*_ORTHO_MASTER.tif"))
+            if masters:
+                found.append((block_id, masters[-1]))
+        return sorted(found, key=lambda item: natural_key(item[0]))
 
     def promoted_master_dir(self, project_id: str, block_id: str) -> Path:
         return self.root / self.project_slug(project_id) / block_id / "master"

@@ -20,6 +20,9 @@ dependencies = [
     "rasterio>=1.4,<2",
     "numpy>=2.1,<3",
     "pyproj>=3.7,<4",
+    # Only for derived previews. Encoding a JPEG is not something to hand-roll, and Rasterio's
+    # GDAL cannot write one without also writing a georeferenced sidecar into the tree.
+    "pillow>=11.0,<12",
 ]
 
 [project.scripts]

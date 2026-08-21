@@ -7,7 +7,6 @@ is recognised from its own manifest rather than from a queue someone has to keep
 
 from __future__ import annotations
 
-import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,9 +25,17 @@ from .packaging.raster import master_filename, package_master
 from .processing.external import ExternalIngestError, SourceOrtho, ingest_external_ortho
 from .qa.raster import run_raster_qa
 from .reporting.manifest import read_manifest, write_manifest, write_qa_result
-from .workspace import RunPaths, Workspace, make_run_id
+from .workspace import RunPaths, Workspace, make_run_id, natural_key
 
-_TRAILING_NUMBER = re.compile(r"(\d+)$")
+__all__ = [
+    "IngestOutcome",
+    "IngestRequest",
+    "discover_blocks",
+    "find_completed_run",
+    "ingest_external_to_master",
+    "natural_key",
+    "package_source_ortho",
+]
 
 
 @dataclass(frozen=True)
@@ -68,14 +75,6 @@ class IngestOutcome:
     @property
     def gate_status(self) -> GateStatus:
         return self.manifest.gate_status if self.manifest else GateStatus.FAIL
-
-
-def natural_key(name: str) -> tuple[str, int]:
-    """Sort B9 before B10, which a plain string sort would not."""
-    match = _TRAILING_NUMBER.search(name)
-    if match is None:
-        return (name, 0)
-    return (name[: match.start()], int(match.group(1)))
 
 
 def discover_blocks(root: Path, asset_name: str) -> list[tuple[str, Path]]:

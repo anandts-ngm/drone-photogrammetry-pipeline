@@ -1,0 +1,202 @@
+"""One browsable image of a whole project, assembled from destriped block renders.
+
+The virtual mosaic addresses the masters at full resolution and is the right thing for
+inspection, but it is 97 gigapixels and needs a pyramid before a viewer can open it. This is
+the opposite trade: a single small raster, destriped, that opens instantly and shows the survey
+as one picture.
+
+Two choices worth stating:
+
+* **Overlaps are averaged, not overwritten.** The blocks have been harmonised, so where two of
+  them image the same ground their values agree to about 7.5%; averaging uses both and softens
+  the join. Taking whichever block was written last would put a hard edge along every seam and
+  discard half the data.
+* **Destriping happens per block, before assembly.** Banding is a per-block property with a
+  per-block orientation -- 42 of the 79 Buduunkhad blocks band vertically and 37 horizontally --
+  so correcting it after assembly would mean fitting a mixture of two orientations at once.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import rasterio
+from numpy.typing import NDArray
+from rasterio.enums import Resampling
+from rasterio.transform import from_origin
+from rasterio.warp import reproject
+
+from .destripe import DEFAULT_TREND_WINDOW, destripe
+from .preview import PreviewError, composite_on_white
+
+DEFAULT_GSD = 1.0
+_MASTER_CREATION = {
+    "driver": "GTiff",
+    "compress": "DEFLATE",
+    "predictor": 2,
+    "tiled": True,
+    "blockxsize": 512,
+    "blockysize": 512,
+    "num_threads": "ALL_CPUS",
+}
+
+
+@dataclass(frozen=True)
+class Overview:
+    path: Path
+    width: int
+    height: int
+    gsd: float
+    blocks: int
+    destriped: int
+    mean_ripple_reduction_pct: float
+    bytes_written: int
+
+
+def _read_for_overview(
+    master: Path, gsd: float
+) -> tuple[NDArray[np.uint8], NDArray[np.uint8], object]:
+    """Read one master down to roughly the overview grid, keeping alpha and georeferencing."""
+    with rasterio.open(master) as ds:
+        if ds.count < 4:
+            raise PreviewError(f"{master.name} has {ds.count} bands; a master carries 4")
+        scale = max(1.0, gsd / float(ds.transform.a))
+        width = max(1, int(ds.width / scale))
+        height = max(1, int(ds.height / scale))
+        rgb = ds.read([1, 2, 3], out_shape=(3, height, width), resampling=Resampling.average)
+        alpha = ds.read(4, out_shape=(height, width), resampling=Resampling.average)
+        transform = ds.transform * ds.transform.scale(ds.width / width, ds.height / height)
+    return rgb, alpha, transform
+
+
+def build_overview(
+    masters: list[Path],
+    destination: Path,
+    *,
+    gsd: float = DEFAULT_GSD,
+    apply_destripe: bool = True,
+    window: int = DEFAULT_TREND_WINDOW,
+    progress: object = None,
+) -> Overview:
+    """Assemble a destriped, browsable overview of every master in a project."""
+    if not masters:
+        raise PreviewError("no masters given; an overview of nothing is not a product")
+
+    bounds = []
+    crs = None
+    for master in masters:
+        with rasterio.open(master) as ds:
+            bounds.append(ds.bounds)
+            crs = crs or ds.crs
+    left = min(b.left for b in bounds)
+    right = max(b.right for b in bounds)
+    bottom = min(b.bottom for b in bounds)
+    top = max(b.top for b in bounds)
+
+    width = max(1, round((right - left) / gsd))
+    height = max(1, round((top - bottom) / gsd))
+    canvas_transform = from_origin(left, top, gsd, gsd)
+
+    # Accumulate a weighted sum so overlapping blocks average rather than overwrite.
+    total = np.zeros((3, height, width), dtype=np.float32)
+    weight = np.zeros((height, width), dtype=np.float32)
+
+    destriped = 0
+    reductions: list[float] = []
+    for index, master in enumerate(masters, start=1):
+        rgb, alpha, source_transform = _read_for_overview(master, gsd)
+
+        if apply_destripe:
+            rgb, result = destripe(rgb, alpha, window=window)
+            if result.ripple_before_pct > 0:
+                destriped += 1
+                reductions.append(result.reduction_pct)
+        else:
+            result = None
+
+        placed = np.zeros((3, height, width), dtype=np.float32)
+        placed_alpha = np.zeros((height, width), dtype=np.float32)
+        reproject(
+            rgb,
+            placed,
+            src_transform=source_transform,
+            src_crs=crs,
+            dst_transform=canvas_transform,
+            dst_crs=crs,
+            resampling=Resampling.average,
+        )
+        reproject(
+            alpha,
+            placed_alpha,
+            src_transform=source_transform,
+            src_crs=crs,
+            dst_transform=canvas_transform,
+            dst_crs=crs,
+            resampling=Resampling.average,
+        )
+
+        coverage = np.clip(placed_alpha / 255.0, 0.0, 1.0)
+        total += placed * coverage[None, :, :]
+        weight += coverage
+
+        if callable(progress):
+            progress(index, len(masters), master, result)
+
+    covered = weight > 0.004
+    rgb_out = np.zeros((3, height, width), dtype=np.uint8)
+    for band in range(3):
+        values = np.zeros((height, width), dtype=np.float32)
+        np.divide(total[band], weight, out=values, where=covered)
+        rgb_out[band] = np.clip(np.rint(values), 0, 255).astype(np.uint8)
+    alpha_out = np.where(covered, 255, 0).astype(np.uint8)
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(
+        destination,
+        "w",
+        width=width,
+        height=height,
+        count=4,
+        dtype="uint8",
+        crs=crs,
+        transform=canvas_transform,
+        nodata=None,
+        photometric="RGB",
+        alpha="NON-PREMULTIPLIED",
+        **_MASTER_CREATION,
+    ) as dst:
+        dst.write(rgb_out, indexes=[1, 2, 3])
+        dst.write(alpha_out, 4)
+        dst.build_overviews([2, 4, 8, 16], Resampling.average)
+        dst.update_tags(
+            note="derived viewing overview; destriped, resampled, not a master",
+            destriped=str(apply_destripe),
+        )
+
+    return Overview(
+        path=destination,
+        width=width,
+        height=height,
+        gsd=gsd,
+        blocks=len(masters),
+        destriped=destriped,
+        mean_ripple_reduction_pct=float(np.mean(reductions)) if reductions else 0.0,
+        bytes_written=destination.stat().st_size,
+    )
+
+
+def write_overview_jpeg(overview: Path, destination: Path, *, quality: int = 88) -> Path:
+    """A flat JPEG of the overview, for anything that cannot open a GeoTIFF."""
+    from PIL import Image
+
+    with rasterio.open(overview) as ds:
+        rgb = ds.read([1, 2, 3])
+        alpha = ds.read(4)
+
+    flattened = composite_on_white(rgb, alpha)
+    image = Image.fromarray(np.ascontiguousarray(flattened.transpose(1, 2, 0)))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    image.save(destination, "JPEG", quality=quality, optimize=True, progressive=True)
+    return destination

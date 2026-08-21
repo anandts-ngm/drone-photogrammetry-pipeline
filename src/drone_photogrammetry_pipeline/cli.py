@@ -9,13 +9,22 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from rich.table import Table
 
 from . import __version__
 from .config import get_settings
+from .derive.mosaic import MosaicError, add_overviews, build_mosaic, overview_factors
+from .derive.overview import DEFAULT_GSD, build_overview, write_overview_jpeg
+from .derive.preview import (
+    DEFAULT_LONGEST_SIDE,
+    DEFAULT_QUALITY,
+    PreviewError,
+    write_contact_sheet,
+    write_preview,
+)
 from .harmonisation import HarmonisationError, solve_gain_offset, solve_gains
 from .ingest.scan import scan_block
 from .ingest.validate import validate_block
@@ -611,6 +620,236 @@ def harmonise(
     solution_path = write_harmonisation(solutions / f"{name}.json", solution)
     csv_path = write_harmonisation_gains_csv(solutions / f"{name}.csv", solution)
     _render_harmonisation(solution, solution_path, csv_path)
+
+
+@app.command()
+def mosaic(
+    project_id: Annotated[str, typer.Option("--project-id", help="Project identifier.")],
+    overviews: Annotated[
+        bool,
+        typer.Option(
+            "--overviews/--no-overviews",
+            help=(
+                "Build an external pyramid beside the mosaic. Without it a zoomed-out view has "
+                "to read every pixel of every master, which does not finish. Costs one full "
+                "pass over the masters."
+            ),
+        ),
+    ] = True,
+) -> None:
+    """Write a virtual mosaic (.vrt) addressing every master in a project.
+
+    Opens in QGIS as a single raster layer. Costs kilobytes: GDAL reads the masters on demand
+    rather than copying them.
+    """
+    settings = get_settings()
+    workspace = Workspace(settings.workspace_root)
+
+    masters = workspace.find_masters(project_id)
+    if not masters:
+        error_console().print(
+            f"no masters for {project_id} under {workspace.project_dir(project_id)}; "
+            "run 'drone-photo run-project' first"
+        )
+        raise typer.Exit(EXIT_FAIL)
+
+    destination = (
+        workspace.derived_dir(project_id) / f"{Workspace.project_slug(project_id)}_mosaic.vrt"
+    )
+    try:
+        built = build_mosaic([path for _, path in masters], destination)
+    except MosaicError as error:
+        error_console().print(f"[bold red]FAILED[/bold red] {error}")
+        raise typer.Exit(EXIT_FAIL) from error
+
+    console().print(
+        f"[bold]{project_id}[/bold]: {built.sources} masters -> "
+        f"{built.width:,} x {built.height:,} px ({built.gigapixels:.1f} Gpx) "
+        f"at {built.pixel_size * 100:.2f} cm"
+    )
+    console().print(f"crs:    {built.crs}")
+    console().print(f"mosaic: {built.path}")
+
+    if not overviews:
+        console().print(
+            "[yellow]no overviews[/yellow]: a viewer asked for the full extent must read every "
+            "pixel of every master, which in practice does not finish"
+        )
+        return
+
+    factors = overview_factors(built.width, built.height)
+    console().print(f"building overviews {factors} (one pass over the masters)...")
+    present = add_overviews(built.path, factors)
+    pyramid = built.path.with_suffix(built.path.suffix + ".ovr")
+    size = pyramid.stat().st_size / _GIB if pyramid.is_file() else 0.0
+    console().print(f"overviews: {present}   {pyramid.name}  {size:.2f} GiB")
+
+
+@app.command()
+def previews(
+    project_id: Annotated[str, typer.Option("--project-id", help="Project identifier.")],
+    longest_side: Annotated[
+        int, typer.Option("--longest-side", help="Long edge of each preview, in pixels.")
+    ] = DEFAULT_LONGEST_SIDE,
+    quality: Annotated[
+        int, typer.Option("--quality", help="JPEG quality, 1-95.")
+    ] = DEFAULT_QUALITY,
+    contact_sheet: Annotated[
+        bool,
+        typer.Option(
+            "--contact-sheet/--no-contact-sheet",
+            help="Also write one page showing every block, labelled.",
+        ),
+    ] = True,
+    apply_destripe: Annotated[
+        bool,
+        typer.Option(
+            "--destripe/--no-destripe",
+            help=(
+                "Remove flight-strip banding. Applied to previews only, never to a master: "
+                "no directional filter can tell a stripe from real linear geology, and a "
+                "preview is the one place where getting that wrong costs nothing."
+            ),
+        ),
+    ] = True,
+) -> None:
+    """Render a small JPEG of every master, plus a contact sheet of the project."""
+    settings = get_settings()
+    workspace = Workspace(settings.workspace_root)
+
+    masters = workspace.find_masters(project_id)
+    if not masters:
+        error_console().print(f"no masters for {project_id}; run 'drone-photo run-project' first")
+        raise typer.Exit(EXIT_FAIL)
+
+    directory = workspace.derived_dir(project_id) / "previews"
+    console().print(f"[bold]{project_id}[/bold]: rendering {len(masters)} previews")
+
+    rendered: list[tuple[str, Any]] = []
+    written = 0
+    reductions: list[float] = []
+    for index, (block_id, master) in enumerate(masters, start=1):
+        try:
+            preview, image, destriped = write_preview(
+                master,
+                directory / f"{block_id}_preview.jpg",
+                longest_side=longest_side,
+                quality=quality,
+                apply_destripe=apply_destripe,
+            )
+        except PreviewError as error:
+            error_console().print(f"[yellow]{block_id}: {error}[/yellow]")
+            continue
+        written += preview.bytes_written
+        rendered.append((block_id, image))
+        # Reported per block rather than only in aggregate: a block whose banding barely moved
+        # is worth seeing, because it means the ripple there was not full-length coherent.
+        banding = ""
+        if destriped is not None:
+            reductions.append(destriped.reduction_pct)
+            banding = (
+                f"  ripple {destriped.ripple_before_pct:.2f}% -> "
+                f"{destriped.ripple_after_pct:.2f}% ({destriped.reduction_pct:+.0f}%)"
+            )
+        console().print(
+            f"[dim]{index:>4}/{len(masters)}[/dim] {block_id:<5} "
+            f"{preview.width}x{preview.height}  {preview.bytes_written / 1024:.0f} KB{banding}"
+        )
+
+    console().print(
+        f"previews: {len(rendered)} files, {written / 1024 / 1024:.1f} MB in {directory}"
+    )
+    if reductions:
+        console().print(
+            f"destriped: {len(reductions)} blocks, mean ripple reduction "
+            f"{sum(reductions) / len(reductions):.0f}%"
+        )
+
+    if contact_sheet and rendered:
+        sheet = write_contact_sheet(
+            rendered,
+            workspace.derived_dir(project_id)
+            / f"{Workspace.project_slug(project_id)}_contact_sheet.jpg",
+        )
+        console().print(
+            f"sheet:    {sheet.path} ({sheet.width}x{sheet.height}, "
+            f"{sheet.bytes_written / 1024 / 1024:.1f} MB)"
+        )
+
+
+@app.command()
+def overview(
+    project_id: Annotated[str, typer.Option("--project-id", help="Project identifier.")],
+    gsd: Annotated[
+        float, typer.Option("--gsd", help="Ground sample distance of the overview, in metres.")
+    ] = DEFAULT_GSD,
+    apply_destripe: Annotated[
+        bool, typer.Option("--destripe/--no-destripe", help="Remove flight-strip banding.")
+    ] = True,
+    jpeg: Annotated[
+        bool, typer.Option("--jpeg/--no-jpeg", help="Also write a flat JPEG beside it.")
+    ] = True,
+) -> None:
+    """Assemble one destriped, browsable image of a whole project.
+
+    Unlike the virtual mosaic this is a single small raster that opens instantly. Overlapping
+    blocks are averaged rather than overwritten, so seams soften instead of stepping.
+    """
+    settings = get_settings()
+    workspace = Workspace(settings.workspace_root)
+
+    masters = workspace.find_masters(project_id)
+    if not masters:
+        error_console().print(f"no masters for {project_id}; run 'drone-photo run-project' first")
+        raise typer.Exit(EXIT_FAIL)
+
+    slug = Workspace.project_slug(project_id)
+    console().print(
+        f"[bold]{project_id}[/bold]: assembling {len(masters)} blocks at {gsd:g} m"
+        + ("  (destriping)" if apply_destripe else "")
+    )
+
+    # A master sits at <block>/runs/<run_id>/master/<file>.tif, so the block is four levels
+    # up. Counting three lands on "runs" and labels every line identically.
+    block_of = {path: block_id for block_id, path in masters}
+
+    def show(index: int, total: int, master: Path, result: Any) -> None:
+        detail = ""
+        if result is not None:
+            detail = (
+                f"  ripple {result.ripple_before_pct:.2f}% -> "
+                f"{result.ripple_after_pct:.2f}% ({result.reduction_pct:+.0f}%)"
+            )
+        console().print(
+            f"[dim]{index:>4}/{total}[/dim] {block_of.get(master, master.stem):<5}{detail}"
+        )
+
+    try:
+        built = build_overview(
+            [path for _, path in masters],
+            workspace.derived_dir(project_id) / f"{slug}_overview.tif",
+            gsd=gsd,
+            apply_destripe=apply_destripe,
+            progress=show,
+        )
+    except PreviewError as error:
+        error_console().print(f"[bold red]FAILED[/bold red] {error}")
+        raise typer.Exit(EXIT_FAIL) from error
+
+    console().print(
+        f"\noverview: {built.width:,} x {built.height:,} px at {built.gsd:g} m  "
+        f"{built.bytes_written / 1024 / 1024:.1f} MB"
+    )
+    if built.destriped:
+        console().print(
+            f"destriped {built.destriped}/{built.blocks} blocks, "
+            f"mean ripple reduction {built.mean_ripple_reduction_pct:.0f}%"
+        )
+    console().print(f"path:     {built.path}")
+
+    if jpeg:
+        flat = write_overview_jpeg(built.path, built.path.with_name(f"{slug}_overview.jpg"))
+        console().print(f"jpeg:     {flat}  {flat.stat().st_size / 1024 / 1024:.1f} MB")
 
 
 @app.command()
