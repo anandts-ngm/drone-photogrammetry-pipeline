@@ -469,6 +469,59 @@ actually completed. A rule known to be wrong by an order of magnitude is not a b
 choosing on someone's behalf, so `run-block` reports the arithmetic and the observed failure and
 leaves the number to the caller.
 
+### 2.24 Every ODM option was being discarded in transit — **FIXED 2026-08-21**
+
+The worst defect found in this project so far, and it was invisible from every product.
+
+NodeODM routes task creation like this, from `/var/www/index.js` in the running container:
+
+```js
+const formDataParser = multer().none();
+const urlEncodedBodyParser = bodyParser.urlencoded({extended: false});
+app.post('/task/new/init', authCheck, taskNew.assignUUID, formDataParser, taskNew.handleInit);
+app.post('/task/cancel',  urlEncodedBodyParser, jsonBodyParser, authCheck, uuidCheck, ...);
+```
+
+`multer().none()` parses multipart/form-data and nothing else. The urlencoded parser exists but
+is wired to `/task/cancel`, `/task/remove` and `/task/restart` — not to `/task/new/init`. This
+client sent that body with httpx's `data=`, which is `application/x-www-form-urlencoded`, so the
+engine discarded it whole and answered HTTP 200.
+
+Read back from the engine, a task created that way carried `name: None` and
+`options: [pc-ept, cog, gltf]` — NodeODM's own defaults, none of ours. Measured against the
+profile on the two P1 reconstructions:
+
+| the profile said | the engine ran |
+|---|---|
+| `texturing-skip-global-seam-leveling: true` | `False` |
+| `dsm: true` | `False` |
+| `orthophoto-resolution: 1.0` | `5` |
+| `max-concurrency: 8` (override) | `32` |
+
+The first row is the `analytical_master` radiometric policy. §4 of `radiometry.md` records that
+a default ODM run is *not* radiometrically neutral — colours are normalised across all images
+unless the setting is off — so both reconstructions were produced with exactly the engine-side
+normalisation the policy forbids, while their manifests recorded a profile hash implying it had
+been applied. The last row explains the two out-of-memory kills: the thread cap never arrived
+either.
+
+**Fixed** by sending the init body as multipart. **And guarded**, because the fix alone would
+leave the same class of failure undetectable: `create_task` now reads the options back from the
+engine after commit and refuses a task whose settings did not arrive. Checking names against
+`/options` was never enough — it proves the engine knows an option, not that it was applied.
+
+Two consequences recorded rather than tidied away:
+
+* The one packaged P1 master produced under the old behaviour was **deleted**. It passed the
+  raster contract, but its manifest asserted a radiometric policy that had not been applied, and
+  a false provenance record is worse than no product.
+* The test that should have caught this asserted the client's own encoding, parsing the init body
+  with `parse_qs`. A test that reflects the code back at itself proves nothing about the system
+  it talks to. The stub now models the engine: it reads multipart only, echoes what arrived
+  through `/task/{uuid}/info`, and a form-encoded body fails it.
+
+The 88 Terra blocks are unaffected — that path never touches ODM.
+
 ### 2.6 Deviations from the proposed repository tree
 
 Six small additions, each with a reason, listed in `milestone-1-plan.md` §2. Flagged here
