@@ -441,6 +441,34 @@ Two things follow for anyone running the P1 path:
   consistent with the earlier area measurement: 352.3 ha of P1 across all blocks, median 2.51 ha
   each, against the L cameras' 6,285 ha. Whatever these blocks are for, it is not area coverage.
 
+### 2.23 ODM's process count is a machine setting, and it is not chosen for you — **DECIDED**
+
+The second real P1 reconstruction was killed by the out-of-memory killer:
+
+```text
+/code/run.sh: line 9: 92098 Killed   python3 $RUNPATH/run.py
+```
+
+It died in image undistortion, well before the orthophoto stage, so the resolution pin of §2.21
+was not the cause. ODM had reported `processes: 32` — one per CPU, its default — while
+undistorting 79 frames of 44.7 MP imagery.
+
+The measurements bracket it: **32 threads completed with 15.4 GiB free and was killed with
+11.5 GiB free.** The default is therefore at the edge on this machine rather than comfortably
+wrong, which is the worst place for a default to be.
+
+`max-concurrency` is now settable through `DPP_ODM_MAX_CONCURRENCY` or `--max-concurrency`, and
+`submit()` takes machine-level overrides separately from the profile's options. It is a setting
+and not a profile field on purpose: a versioned profile describes the product, and baking one
+workstation's memory into it would travel to every other machine that pulled the repository.
+
+**No number is chosen automatically**, and that is deliberate. ODM's own guidance — "about 1 GB
+per thread and 2 megapixel image resolution", from its `--max-concurrency` help — works out at
+22 GiB per thread for these frames, which would mean one thread on a machine where 32 has
+actually completed. A rule known to be wrong by an order of magnitude is not a basis for
+choosing on someone's behalf, so `run-block` reports the arithmetic and the observed failure and
+leaves the number to the caller.
+
 ### 2.6 Deviations from the proposed repository tree
 
 Six small additions, each with a reason, listed in `milestone-1-plan.md` §2. Flagged here

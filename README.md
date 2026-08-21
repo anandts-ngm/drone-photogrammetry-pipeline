@@ -223,6 +223,13 @@ uv run drone-photo run-block "<flight folder>" --project-id "Buduunkhad P1" \
 packages to the master contract and runs QA — one command. Ctrl-C stops the watching, not the
 task: `drone-photo fetch <task id>` collects it afterwards.
 
+**Cap the threads for large imagery.** ODM defaults to one process per CPU, which 44.7 MP P1
+frames cannot afford: a 79-frame reconstruction here completed with 15.4 GiB of RAM free and was
+killed by the out-of-memory killer with 11.5 GiB free, during undistortion. Set
+`DPP_ODM_MAX_CONCURRENCY` in `.env` or pass `--max-concurrency`. The command warns when the
+imagery is large and no cap is set, but does not pick a number for you — ODM's own rule of thumb
+would say one thread, and 32 has demonstrably worked.
+
 **A P1 folder is one flight strip, not a block.** Measured on the local flight: the folder holds
 79 exposures spanning 16 × 106 m, while its mark file covers the whole flight, 649 exposures
 over 103 × 109 m. Reconstructing one folder gives a correct master of that strip — 0.4 ha — and

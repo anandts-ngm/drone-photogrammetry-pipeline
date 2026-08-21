@@ -99,18 +99,24 @@ def submit(
     *,
     validate_options: bool = True,
     extra_uploads: Sequence[Path] = (),
+    overrides: dict[str, Any] | None = None,
 ) -> str:
     """Create a NodeODM task for a block. Returns the task uuid.
 
     `extra_uploads` carries files ODM detects by name that are not in the source folder — a
     `geo.txt` this pipeline generated, for instance. They go to the engine as uploads because
     the alternative is writing them next to the imagery, and a source tree stays as delivered.
+
+    `overrides` carries options that describe the machine rather than the product, such as
+    `max-concurrency`. They are merged over the profile's own options and validated with them,
+    so an override the engine does not recognise fails here rather than being ignored.
     """
     if not block.is_processable:
         reasons = "; ".join(f"{f.name}: {f.detail}" for f in block.fatal)
         raise OdmProcessingError(f"{block.block.block_id} did not pass validation — {reasons}")
 
     options = odm_options(profile)
+    options.update(overrides or {})
     if validate_options and options:
         unknown = client.unknown_options(options)
         if unknown:

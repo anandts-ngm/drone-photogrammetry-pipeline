@@ -25,6 +25,17 @@ class Settings(BaseSettings):
 
     profiles_dir: Path = Path("profiles")
     nodeodm_url: str = "http://localhost:3000"
+
+    # How many processes ODM may use. A property of this machine rather than of a delivery,
+    # which is why it is a setting and not a profile field: a versioned profile describes the
+    # product, and baking one workstation's memory into it would travel to every other.
+    #
+    # Unset means ODM's default, its CPU count. That is too many for large imagery: ODM's own
+    # guidance is about 1 GB per thread per 2 megapixels, so 44.7 MP DJI P1 frames want roughly
+    # 22 GB each. Measured here, 32 threads on 79 P1 images survived with 15.4 GB free and was
+    # killed by the out-of-memory killer during undistortion with 11.5 GB free.
+    odm_max_concurrency: int | None = None
+
     log_level: str = "INFO"
 
 

@@ -12,9 +12,10 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, ClassVar
 
 import typer
+from PIL import Image
 from rich.progress import (
     BarColumn,
     DownloadColumn,
@@ -215,6 +216,81 @@ def _progress(label: str, total: float, *, unit: str) -> Iterator[Callable[[floa
     with Progress(*columns, console=console(), transient=True) as bar:
         task = bar.add_task(label, total=total)
         yield lambda amount: bar.advance(task, amount)
+
+
+# ODM's own guidance, from its `--max-concurrency` help: "Peak memory requirement is ~1GB per
+# thread and 2 megapixel image resolution."
+_ODM_GIB_PER_THREAD_PER_2MP = 1.0
+
+
+def _concurrency_advice(images: list[Path], requested: int | None) -> tuple[int | None, str]:
+    """Whether this imagery is large enough for ODM's default process count to be a risk.
+
+    Reports rather than decides. ODM's rule -- about 1 GiB per thread per 2 megapixels -- gives
+    1 thread for 44.7 MP frames on this machine, and a run at 32 threads has completed here, so
+    the rule is far more pessimistic than the engine's actual behaviour once it has resized by
+    GSD. Choosing a number from a rule that is known to be wrong by an order of magnitude would
+    be a guess dressed as a calculation.
+
+    What is measured: 32 threads on 79 P1 frames completed with 15.4 GiB free and was killed
+    during undistortion with 11.5 GiB free. So the default is at the edge on this machine, and
+    the caller is told to set a cap rather than having one invented for them.
+    """
+    if not images or requested is not None:
+        return requested, ""
+    try:
+        with Image.open(images[0]) as probe:
+            megapixels = probe.width * probe.height / 1e6
+    except OSError:
+        return requested, ""
+
+    free_gib = _free_memory_bytes() / _GIB
+    per_thread = _ODM_GIB_PER_THREAD_PER_2MP * megapixels / 2.0
+    if per_thread <= free_gib:
+        return requested, ""
+    return requested, (
+        f"[yellow]{megapixels:.1f} MP images and no thread cap[/yellow]: ODM will use one "
+        f"process per CPU, and its own guidance is about {per_thread:.0f} GiB per thread against "
+        f"{free_gib:.0f} GiB free. A 79-frame P1 block was killed here during undistortion at "
+        "this size. Pass --max-concurrency, or set DPP_ODM_MAX_CONCURRENCY, if it fails"
+    )
+
+
+def _free_memory_bytes() -> int:
+    """Free physical memory, or 0 where it cannot be read.
+
+    Read from /proc on Linux and through the Windows API otherwise, rather than taking a
+    dependency on psutil for one number.
+    """
+    meminfo = Path("/proc/meminfo")
+    if meminfo.is_file():
+        for line in meminfo.read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+        return 0
+    try:
+        import ctypes
+
+        class _Status(ctypes.Structure):
+            _fields_: ClassVar = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = _Status()
+        status.dwLength = ctypes.sizeof(_Status)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return 0
+        return int(status.ullAvailPhys)
+    except (OSError, AttributeError, ValueError):
+        return 0
 
 
 def _free_bytes(path: Path) -> int:
@@ -1036,6 +1112,17 @@ def run_block(
     height_type: Annotated[
         HeightType, typer.Option("--height-type", help="Vertical reference of the delivery.")
     ] = HeightType.UNKNOWN,
+    max_concurrency: Annotated[
+        int | None,
+        typer.Option(
+            "--max-concurrency",
+            help=(
+                "Cap ODM's process count. Defaults to DPP_ODM_MAX_CONCURRENCY, then to a value "
+                "computed from the image size and free memory. ODM's own default is the CPU "
+                "count, which large imagery cannot afford."
+            ),
+        ),
+    ] = None,
     poll_seconds: Annotated[
         float, typer.Option("--poll-seconds", help="How often to ask the engine for progress.")
     ] = 15.0,
@@ -1083,12 +1170,21 @@ def run_block(
         node = client.info()
         console().print(f"engine:   {node.engine} {node.engineVersion} (NodeODM {node.version})")
 
+        concurrency, advice = _concurrency_advice(
+            block.images, max_concurrency or settings.odm_max_concurrency
+        )
+        if advice:
+            error_console().print(advice)
+        if concurrency is not None:
+            console().print(f"threads:  {concurrency}")
+
         try:
             uuid = submit(
                 validated,
                 loaded.profile,
                 client,
                 extra_uploads=[geo] if geo is not None else [],
+                overrides=({"max-concurrency": concurrency} if concurrency is not None else None),
             )
         except (OdmProcessingError, NodeODMError) as error:
             error_console().print(f"[bold red]FAILED[/bold red] {error}")
