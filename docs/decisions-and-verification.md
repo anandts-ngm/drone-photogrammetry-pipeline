@@ -419,8 +419,36 @@ The cause is ODM's `orthophoto-resolution` default of 5 cm/px, which the profile
 alone on the grounds that resolutions are tuning values. That reasoning was wrong: the master
 contract requires native resolution, so a coarser engine output is a contract violation, not a
 tuning preference. All four ODM profiles now pin `orthophoto-resolution: 1.0` with
-`ignore-gsd: false`, which asks for finer than any of these flights can deliver and lets the
-engine clamp to what the imagery actually supports. Profile versions bumped 1 → 2.
+`ignore-gsd: false`. Profile versions bumped 1 → 2.
+
+**The clamp this relied on has not been observed, and the pin may now over-resolve.** The
+intent was to ask for finer than any flight can deliver and let ODM cap the request at its own
+ground-sample-distance estimate, which its `--orthophoto-resolution` help describes: *"Note that
+this value is capped by a ground sampling distance (GSD) estimate."* Measured on the corrected
+run, it was not capped — 1.0 cm was requested and 1.000 cm delivered, with no "ignoring
+resolution" message in the log. Against that:
+
+| source | figure |
+|---|---|
+| requested, and delivered | 1.00 cm |
+| sensor geometry: 8192 px across 35.9 mm, 35 mm lens, 120 m EXIF relative altitude | 1.50 cm |
+| ODM's own 2.5D DSM resolution for this task | 2 cm |
+| ODM's `stats.json` `gsd` field | `null` — not recorded |
+
+So the delivered orthophoto is probably 1.5x finer than the imagery supports, which is
+manufacturing pixels in a product whose contract says native. The 120 m figure is itself
+uncertain: EXIF relative altitude is measured from takeoff, not from the imaged surface, and
+this target sits on rising ground.
+
+Left as it is for now, deliberately, because over-resolving is recoverable by downsampling while
+the 5 cm default threw away detail irrecoverably — but it is **not** the settled answer. Two
+candidates, neither yet implemented:
+
+* Compute the native GSD per flight from the imagery's own focal length, sensor width and
+  altitude, and pass it as an override the way `max-concurrency` is passed. Measured from the
+  flight rather than assumed, and printed — but it inherits the takeoff-versus-surface ambiguity.
+* Read ODM's GSD back from a reconstruction and re-run the orthophoto stage at that resolution.
+  Correct, and it costs a second pass.
 
 `dem-resolution` is deliberately left at ODM's 5 cm. A DSM at 1.5 cm from photogrammetry is
 mostly noise, and for the L cameras the LiDAR path is authoritative for elevation anyway.
@@ -656,6 +684,7 @@ simply be the measurement floor rather than a correctable effect.
 | ~~V6~~ | Characteristics of a real DJI Terra DOM export | **RESOLVED — see §3.1.2** |
 | V8 | Does `PREDICTOR=2` with `BIGTIFF=YES` behave identically across the GDAL versions in ODM's container and in our packager | Round-trip a fixture and compare pixel checksums. **Half-answered:** our side round-trips RGB band checksums unchanged (`--verify-pixels`, covered by tests). The ODM-container side still needs a real ODM output. |
 | V9 | Whether L-camera RGB from a LiDAR-parameterised flight has usable overlap for ODM reconstruction | Benchmark processing on a real L2/L3 block |
+| V11 | What resolution an ODM orthophoto should be asked for, given that the GSD cap its help describes was not observed | Compute native GSD from the flight's own optics and altitude, or read ODM's estimate back from a reconstruction and re-run the orthophoto stage. See §2.21 |
 | V10 | L3 sensor specifications | Not publicly established — needs to come from you or from the acquisition metadata |
 
 Nothing in §3.2 is coded against until it is answered. Where a milestone-1 module needs one
