@@ -202,6 +202,37 @@ unweighted gain-only left 10.1% where weighted gain-only left 6.4%, so an unweig
 gain+offset at 8.0% could look like an improvement while being worse than the solution
 actually deployed. Both solves are now weighted on the same basis.
 
+### 2.12 Downstream train/test splits — **CORRECTED: geographic, not block-disjoint**
+
+An earlier revision of `README.md` advised that because block identity stays recoverable from
+corrected imagery at about 14.6 times chance, downstream splits "should be block-disjoint".
+That advice was wrong, and it was committed and pushed before being caught.
+
+Holding out whole blocks does not isolate anything here. Every block overlaps at least one
+other, so each survey is a **single connected component** of overlapping footprints — which
+this pipeline's own harmonisation solve reports directly, because the anchor count depends on
+it:
+
+| project | blocks | constraints | connected components |
+|---|---|---|---|
+| buduunkhad | 79 | 231 | 1 |
+| sant | 9 | 20 | 1 |
+
+A held-out block's ground is imaged by its neighbours, so its pixels are in the training set
+under a different block id. The split has to be **geographic**: cut along a coordinate axis,
+exclude a buffer either side of each cut, and assign each sampled *window* by its centre
+rather than assigning whole blocks. Blocks straddle the cuts, which is precisely why
+assignment is per window.
+
+Two measurements worth keeping with this. Footprints are rotated rectangles inside
+axis-aligned bounding boxes, so bounding boxes overstate the overlap as **3.06x** where the
+real figure from footprint geometry is **1.43x** — a split reasoning from bounding boxes would
+mis-estimate the leak. And uniform sampling inside a bounding box lands outside the imagery
+about **65%** of the time, which is why windows must be placed from a validity mask.
+
+Both figures come from the downstream `lithology-ml` repository, which had already reached the
+correct conclusion; the error here was advising otherwise without checking.
+
 ### 2.6 Deviations from the proposed repository tree
 
 Six small additions, each with a reason, listed in `milestone-1-plan.md` §2. Flagged here

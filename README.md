@@ -146,9 +146,14 @@ unchanged; a correction changes them.
   shadow to pure black in 107 of 237 block-bands.
 - The delivered mosaics carry flight-strip striping of about 2.7 % of scene brightness,
   present in 99 % of blocks. It comes from Terra's blending, not from this pipeline.
-- Block identity stays recoverable from corrected imagery at about 14.6 times chance, so
-  train/test splits for downstream models should be block-disjoint. Correction reduces
-  disagreement between blocks; it does not make them indistinguishable.
+- Block identity stays recoverable from corrected imagery at about 14.6 times chance.
+  Correction reduces disagreement between blocks; it does not make them indistinguishable.
+  A downstream train/test split must therefore be **geographic, cut along a coordinate axis
+  with an exclusion buffer, and applied per sampled window** — not block-disjoint. Holding
+  out whole blocks does not work here: every block overlaps another, so the survey is one
+  connected component of overlapping footprints and a held-out block's ground is imaged by
+  its neighbours. Measured on the Buduunkhad delivery, bounding boxes overstate that overlap
+  as 3.06x where the real figure from footprint geometry is 1.43x.
 
 `docs/radiometry.md` has the method and the measurements.
 
